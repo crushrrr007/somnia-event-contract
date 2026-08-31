@@ -4,8 +4,9 @@ import { createPublicClient, createWalletClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { somniaShannon } from '@somnia-chain/markets-sdk/chains'
 
-const privateKey = process.env.DEPLOYER_PRIVATE_KEY
-if (!privateKey?.startsWith('0x')) throw new Error('DEPLOYER_PRIVATE_KEY must be a 0x-prefixed testnet private key.')
+const rawPrivateKey = process.env.DEPLOYER_PRIVATE_KEY?.trim()
+if (!rawPrivateKey) throw new Error('DEPLOYER_PRIVATE_KEY is required.')
+const privateKey = (rawPrivateKey.startsWith('0x') ? rawPrivateKey : `0x${rawPrivateKey}`) as `0x${string}`
 
 const source = await readFile(new URL('../contracts/DecisionRegistry.sol', import.meta.url), 'utf8')
 const input = {
