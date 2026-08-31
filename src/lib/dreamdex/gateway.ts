@@ -15,6 +15,7 @@ import {
   calculateBoundedApprovalCap,
   claimableOutcomes,
   filterEligibleMarkets,
+  MINIMUM_TRADE_HEADROOM_SECONDS,
   needsTokenApproval,
   type OutcomeIndex,
   type OutcomePosition,
@@ -420,8 +421,8 @@ export async function executeIocOrder({
       if (onchain.status !== 1 || onchain.finalized || onchain.isResolved || onchain.isVoided) {
         throw tradeFailure('This market is no longer trading.')
       }
-      if (onchain.expiry - nowSec < 300n) {
-        throw tradeFailure('This market closes too soon for a safe trade.')
+      if (onchain.expiry - nowSec < BigInt(MINIMUM_TRADE_HEADROOM_SECONDS)) {
+        throw tradeFailure(`This market closes in under ${MINIMUM_TRADE_HEADROOM_SECONDS} seconds. Choose the next market to avoid an expiry race.`)
       }
       if (onchain.pool.toLowerCase() !== market.poolAddress.toLowerCase()) {
         throw tradeFailure('This market binding changed. Refresh and choose it again.')

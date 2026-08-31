@@ -9,7 +9,7 @@ import {
 } from '@somnia-chain/markets-sdk'
 
 const TRADING_STATUS = 1
-const MINIMUM_HEADROOM_SECONDS = 300
+export const MINIMUM_TRADE_HEADROOM_SECONDS = 60
 
 export function isTradeEligible(
   status: number,
@@ -17,7 +17,7 @@ export function isTradeEligible(
   nowSec: number,
 ): boolean {
   const remaining = Number(expiry) - nowSec
-  return status === TRADING_STATUS && remaining >= MINIMUM_HEADROOM_SECONDS
+  return status === TRADING_STATUS && remaining >= MINIMUM_TRADE_HEADROOM_SECONDS
 }
 
 export type MarketEligibility = {

@@ -98,9 +98,9 @@ describe('decision helpers', () => {
     })
   })
 
-  it('requires Trading status and five minutes of headroom', () => {
-    expect(isTradeEligible(1, '1300', 1000)).toBe(true)
-    expect(isTradeEligible(1, '1299', 1000)).toBe(false)
+  it('requires Trading status and one minute of headroom', () => {
+    expect(isTradeEligible(1, '1060', 1000)).toBe(true)
+    expect(isTradeEligible(1, '1059', 1000)).toBe(false)
     expect(isTradeEligible(2, '1500', 1000)).toBe(false)
   })
 
@@ -257,8 +257,8 @@ describe('decision helpers', () => {
 
   it('filters stale, finalized, resolved, voided, and closing-soon candidates', () => {
     const candidates = [
-      { id: 'accepted', onchainStatus: 1, expiry: '1400', finalized: false, isResolved: false, isVoided: false },
-      { id: 'closing', onchainStatus: 1, expiry: '1299', finalized: false, isResolved: false, isVoided: false },
+      { id: 'accepted', onchainStatus: 1, expiry: '1060', finalized: false, isResolved: false, isVoided: false },
+      { id: 'closing', onchainStatus: 1, expiry: '1059', finalized: false, isResolved: false, isVoided: false },
       { id: 'finalized', onchainStatus: 1, expiry: '1400', finalized: true, isResolved: false, isVoided: false },
       { id: 'resolved', onchainStatus: 1, expiry: '1400', finalized: false, isResolved: true, isVoided: false },
       { id: 'locked', onchainStatus: 2, expiry: '1400', finalized: false, isResolved: false, isVoided: false },
