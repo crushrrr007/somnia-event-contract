@@ -224,6 +224,10 @@ export function calculateBoundedApprovalCap(
     : maximumTradeCollateral
 }
 
+export function needsTokenApproval(allowance: bigint, requiredAmount: bigint): boolean {
+  return allowance < requiredAmount
+}
+
 export type ProtectedIocQuote = {
   yesPrice: bigint
   collateral: bigint

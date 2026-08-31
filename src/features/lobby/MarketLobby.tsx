@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { createWalletClient, custom, type Address, type Hex, type WalletClient } from 'viem'
+import { createWalletClient, custom, type Address, type EIP1193Provider, type Hex, type WalletClient } from 'viem'
 import { somniaShannon } from '@somnia-chain/markets-sdk/chains'
 import {
   buildPassportMetrics,
@@ -19,10 +19,19 @@ import {
   type SettlementSnapshot,
   type WalletTradeRecord,
 } from '../../lib/dreamdex/gateway'
+import {
+  DECISION_REGISTRY_ADDRESS,
+  createChallenge as createOnchainChallenge,
+  fetchChallenge,
+  fetchDecisions,
+  fetchWalletChallenges,
+  joinChallenge as joinOnchainChallenge,
+  recordDecision,
+  type OnchainChallenge,
+} from '../../lib/dreamdex/registry'
 
 type ProviderListener = (...args: unknown[]) => void
-type InjectedProvider = {
-  request(...args: any[]): Promise<any>
+type InjectedProvider = EIP1193Provider & {
   on?: (event: string, listener: ProviderListener) => void
   removeListener?: (event: string, listener: ProviderListener) => void
 }
@@ -120,33 +129,36 @@ const duelModes = [
   { id: 'benchmark', label: 'Shadow Coach', copy: 'Compare, do not copy' },
 ] as const
 
-async function requestChallenge(path: string, init?: RequestInit): Promise<ChallengeRecord> {
-  const response = await fetch(`/api/challenges${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+function toChallengeRecord(challenge: OnchainChallenge, market?: LiveMarketWithBook): ChallengeRecord {
+  const payload = (call: OnchainChallenge['creator']): ChallengePayload => ({
+    marketId: challenge.marketId,
+    asset: market?.asset ?? 'Market',
+    interval: market?.interval ?? null,
+    question: market?.question ?? 'On-chain Reason Duel',
+    expiry: challenge.expiry.toString(),
+    side: call.side,
+    reason: call.reason,
+    confidence: call.confidence,
+    amount: call.amount,
+    wallet: call.wallet,
   })
-  const body = await response.json() as ChallengeRecord & { error?: string }
-  if (!response.ok) throw new Error(body.error ?? 'Challenge request failed.')
-  return body
+  return {
+    id: challenge.id,
+    createdAt: challenge.createdAt,
+    status: challenge.status,
+    marketId: challenge.marketId,
+    asset: market?.asset ?? 'Market',
+    interval: market?.interval ?? null,
+    question: market?.question ?? 'On-chain Reason Duel',
+    expiry: challenge.expiry.toString(),
+    creator: payload(challenge.creator),
+    opponent: challenge.opponent ? payload(challenge.opponent) : null,
+  }
 }
 
-function createChallenge(payload: ChallengePayload) {
-  return requestChallenge('', { method: 'POST', body: JSON.stringify(payload) })
-}
-
-async function listChallenges(): Promise<ChallengeRecord[]> {
-  const response = await fetch('/api/challenges')
-  const body = await response.json() as ChallengeRecord[] & { error?: string }
-  if (!response.ok) throw new Error(body.error ?? 'Challenge list could not be loaded.')
-  return body
-}
-
-function loadChallenge(id: string) {
-  return requestChallenge(`/${encodeURIComponent(id)}`)
-}
-
-function joinChallenge(id: string, payload: ChallengePayload) {
-  return requestChallenge(`/${encodeURIComponent(id)}/join`, { method: 'POST', body: JSON.stringify(payload) })
+async function loadChallenge(id: string, markets: LiveMarketWithBook[] = []) {
+  const challenge = await fetchChallenge(id)
+  return toChallengeRecord(challenge, markets.find((market) => market.marketId.toLowerCase() === challenge.marketId.toLowerCase()))
 }
 
 const CHALLENGE_CACHE_KEY = 'signalsprint.challenge-cache.v1'
@@ -1151,21 +1163,24 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
     let active = true
     const cachedChallenges = readChallengeCache()
     setChallenges(cachedChallenges)
-    listChallenges()
-      .then((records) => {
-        const merged = mergeChallenges(records, readChallengeCache())
+    if (!wallet.address || !DECISION_REGISTRY_ADDRESS) return () => { active = false }
+    fetchWalletChallenges(wallet.address)
+      .then((onchain) => {
+        const records = onchain.map((challenge) => toChallengeRecord(
+          challenge,
+          markets.find((market) => market.marketId.toLowerCase() === challenge.marketId.toLowerCase()),
+        ))
+        const merged = mergeChallenges(records, cachedChallenges)
         saveChallengeCache(merged)
         if (active) setChallenges(merged)
       })
       .catch((cause: unknown) => {
         if (active && cachedChallenges.length === 0) {
-          setChallengeError(cause instanceof Error ? cause.message : 'Challenge board could not be loaded.')
+          setChallengeError(cause instanceof Error ? cause.message : 'On-chain challenges could not be loaded.')
         }
       })
-    return () => {
-      active = false
-    }
-  }, [])
+    return () => { active = false }
+  }, [wallet.address, markets])
 
   useEffect(() => {
     setFollowUps(readCoachFollowUps())
@@ -1187,9 +1202,18 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
       let records = localHistory
       try {
         const remoteHistory = await listWalletTradeHistory(address)
-        records = mergeTradeHistory(remoteHistory, readTradeHistory(address))
+        let hydratedRemote = remoteHistory
+        if (DECISION_REGISTRY_ADDRESS) {
+          const decisions = await fetchDecisions(address)
+          const byTradeHash = new Map(decisions.map((decision) => [decision.tradeHash.toLowerCase(), decision]))
+          hydratedRemote = remoteHistory.map((record) => {
+            const decision = byTradeHash.get(record.hash.toLowerCase())
+            return decision ? { ...record, confidence: decision.confidence, thesis: decision.thesis } : record
+          })
+        }
+        records = mergeTradeHistory(hydratedRemote, readTradeHistory(address))
       } catch {
-        // Keep locally saved receipts visible while the indexer is unavailable.
+        // Keep locally saved receipts visible while the chain or indexer is unavailable.
       }
       if (!active) return
       setHistory(records)
@@ -1223,7 +1247,7 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
     const challengeId = new URLSearchParams(window.location.search).get('challenge')
     if (!challengeId) return
     let active = true
-    loadChallenge(challengeId)
+    loadChallenge(challengeId, markets)
       .then((challenge) => {
         saveChallengeCache([challenge, ...readChallengeCache()])
         if (active) {
@@ -1244,7 +1268,7 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
     return () => {
       active = false
     }
-  }, [])
+  }, [markets, onViewChange])
 
   function openChallenge(challenge: ChallengeRecord) {
     const market = markets.find((candidate) => candidate.marketId.toLowerCase() === challenge.marketId.toLowerCase())
@@ -1358,6 +1382,26 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
         thesis,
       }))
 
+      if (result.filledAmount > 0 && DECISION_REGISTRY_ADDRESS) {
+        try {
+          await recordDecision({
+            marketId: selectedMarket.marketId as Hex,
+            tradeHash: result.hash as Hex,
+            side: outcome,
+            confidence,
+            thesis,
+            address: wallet.address,
+            walletClient: wallet.client,
+          })
+          setTrade((current) => ({ ...current, message: `${current.message} Decision receipt saved on-chain.` }))
+        } catch (cause: unknown) {
+          setTrade((current) => ({
+            ...current,
+            message: `${current.message} Trade is confirmed; decision receipt was skipped: ${cause instanceof Error ? cause.message : 'wallet request not completed.'}`,
+          }))
+        }
+      }
+
       if (result.filledAmount > 0) {
         const scheduledAt = Number(selectedMarket.expiry) * 1000
         if (Number.isFinite(scheduledAt)) {
@@ -1389,9 +1433,29 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
           wallet: wallet.address.toLowerCase(),
         }
         try {
-          const challenge = incomingChallenge
-            ? await joinChallenge(incomingChallenge.id, payload)
-            : await createChallenge(payload)
+          if (!DECISION_REGISTRY_ADDRESS) throw new Error('Decision Registry is not configured.')
+          if (incomingChallenge) {
+            await joinOnchainChallenge({
+              id: incomingChallenge.id,
+              side: payload.side,
+              confidence: payload.confidence,
+              reason: payload.reason,
+              amount: payload.amount,
+              address: wallet.address,
+              walletClient: wallet.client,
+            })
+          }
+          const challengeId = incomingChallenge?.id ?? await createOnchainChallenge({
+            marketId: payload.marketId as Hex,
+            side: payload.side,
+            confidence: payload.confidence,
+            reason: payload.reason,
+            amount: payload.amount,
+            expiry: Number(payload.expiry),
+            address: wallet.address,
+            walletClient: wallet.client,
+          })
+          const challenge = await loadChallenge(challengeId, markets)
           saveChallengeCache([challenge, ...readChallengeCache()])
           setActiveChallenge(challenge)
           setChallenges((current) => mergeChallenges([challenge], current))

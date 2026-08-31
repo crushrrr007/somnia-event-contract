@@ -15,12 +15,13 @@ import {
   calculateBoundedApprovalCap,
   claimableOutcomes,
   filterEligibleMarkets,
+  needsTokenApproval,
   type OutcomeIndex,
   type OutcomePosition,
   type DecisionResult,
 } from './decision'
 
-const INDEXER_URL = 'https://dev.smk.somnia.host/v1/graphql'
+const INDEXER_URL = import.meta.env.VITE_INDEXER_URL ?? 'https://dev.smk.somnia.host/v1/graphql'
 
 export type LiveMarket = Pick<
   BinaryMarket,
@@ -355,31 +356,28 @@ async function approveExactCollateral({
     functionName: 'allowance',
     args: [owner, spender],
   })
-  if (allowance === amount) return
+  if (!needsTokenApproval(allowance, amount)) return
 
-  if (allowance > 0n) {
-    const resetHash = await walletClient.writeContract({
+  const approve = async (value: bigint) => {
+    const hash = await walletClient.writeContract({
       address: token,
       abi: erc20Abi,
       functionName: 'approve',
-      args: [spender, 0n],
+      args: [spender, value],
       account: owner,
       chain: somniaShannon,
     })
-    const resetReceipt = await publicClient.waitForTransactionReceipt({ hash: resetHash })
-    if (resetReceipt.status !== 'success') throw tradeFailure('Token approval reset was not confirmed.')
+    const receipt = await publicClient.waitForTransactionReceipt({ hash })
+    if (receipt.status !== 'success') throw tradeFailure('Token approval was not confirmed.')
   }
 
-  const approvalHash = await walletClient.writeContract({
-    address: token,
-    abi: erc20Abi,
-    functionName: 'approve',
-    args: [spender, amount],
-    account: owner,
-    chain: somniaShannon,
-  })
-  const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: approvalHash })
-  if (approvalReceipt.status !== 'success') throw tradeFailure('Exact token approval was not confirmed.')
+  try {
+    await approve(amount)
+  } catch (cause) {
+    if (allowance === 0n) throw cause
+    await approve(0n)
+    await approve(amount)
+  }
 }
 
 export async function executeIocOrder({

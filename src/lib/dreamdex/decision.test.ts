@@ -9,6 +9,7 @@ import {
   filterEligibleMarkets,
   isTradeEligible,
   marketKey,
+  needsTokenApproval,
   normalizeBook,
 } from './decision'
 
@@ -163,6 +164,12 @@ describe('decision helpers', () => {
   it('caps token approval at one collateral unit per requested contract', () => {
     expect(calculateBoundedApprovalCap(5, 10_000_000n, 6)).toBe(5_000_000n)
     expect(calculateBoundedApprovalCap(5, 2_000_000n, 6)).toBe(2_000_000n)
+  })
+
+  it('skips approval whenever the existing allowance covers the bounded cap', () => {
+    expect(needsTokenApproval(5_000_000n, 5_000_000n)).toBe(false)
+    expect(needsTokenApproval(8_000_000n, 5_000_000n)).toBe(false)
+    expect(needsTokenApproval(4_999_999n, 5_000_000n)).toBe(true)
   })
 
   it('walks multiple YES ask levels and adds a tick-aligned protective cushion', () => {
