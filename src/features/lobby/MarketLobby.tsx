@@ -1,0 +1,1609 @@
+import { useEffect, useState } from 'react'
+import { createWalletClient, custom, type Address, type Hex, type WalletClient } from 'viem'
+import { somniaShannon } from '@somnia-chain/markets-sdk/chains'
+import {
+  buildPassportMetrics,
+  evaluateDecisionScore,
+  normalizeBook,
+  type OutcomeIndex,
+} from '../../lib/dreamdex/decision'
+import {
+  executeIocOrder,
+  listLiveMarkets,
+  listWalletSettlementHistory,
+  listWalletTradeHistory,
+  loadSettlement,
+  redeemSettlement,
+  type IocTradeResult,
+  type LiveMarketWithBook,
+  type SettlementSnapshot,
+  type WalletTradeRecord,
+} from '../../lib/dreamdex/gateway'
+
+type ProviderListener = (...args: unknown[]) => void
+type InjectedProvider = {
+  request(...args: any[]): Promise<any>
+  on?: (event: string, listener: ProviderListener) => void
+  removeListener?: (event: string, listener: ProviderListener) => void
+}
+
+declare global {
+  interface Window {
+    ethereum?: InjectedProvider
+  }
+}
+
+function formatCountdown(expiry: string) {
+  const seconds = Math.max(0, Number(expiry) - Math.floor(Date.now() / 1000))
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 1) return '< 1m'
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+function MarketCard({ market, onSelect }: { market: LiveMarketWithBook; onSelect: () => void }) {
+  const book = normalizeBook(market.book, market.quoteDecimals)
+  const formatProbability = (probability: number | null) => probability === null
+    ? '—'
+    : `${Math.round(probability * 100)}%`
+  return (
+    <article className="market-card" data-market-id={market.marketId}>
+      <div className="market-card-topline">
+        <span className="market-asset">{market.asset}</span>
+        <span className="market-status"><span className="status-dot" /> {market.status}</span>
+      </div>
+      <h3>{market.question}</h3>
+      <div className="market-meta">
+        <span>closes in <strong>{formatCountdown(market.expiry)}</strong></span>
+        <span>{market.interval ?? 'live'} window</span>
+      </div>
+      <div className="market-book">
+        <span>YES book</span>
+        <strong>{book.hasLiquidity ? `${formatProbability(book.bestBid)} bid / ${formatProbability(book.bestAsk)} ask` : 'No liquidity yet'}</strong>
+      </div>
+      <button className="market-action" type="button" onClick={onSelect}>Compose a call <span>↗</span></button>
+      <p className="market-id">marketId · …{market.marketId.slice(-8)}</p>
+    </article>
+  )
+}
+
+type PracticeSide = 'UP' | 'DOWN'
+type ReasonId = 'ABOVE_OPEN' | 'MOMENTUM' | 'REVERSAL' | 'MARKET_ODDS' | 'INSTINCT'
+
+const reasonCards = [
+  { id: 'ABOVE_OPEN', label: 'Above the open', copy: 'Price is holding above the opening line.' },
+  { id: 'MOMENTUM', label: 'Momentum', copy: 'The move looks strong enough to continue.' },
+  { id: 'REVERSAL', label: 'Reversal', copy: 'The move looks stretched and may turn.' },
+  { id: 'MARKET_ODDS', label: 'Market odds', copy: 'The contract price looks mispriced.' },
+  { id: 'INSTINCT', label: 'Instinct', copy: 'I am practicing a hunch.' },
+] as const
+
+const confidenceBands = [
+  { label: 'Exploring', value: 55, copy: 'Learning the pattern' },
+  { label: 'Leaning', value: 75, copy: 'I have a reason' },
+  { label: 'Strong view', value: 90, copy: 'I would defend it' },
+] as const
+
+type DuelMode = 'solo' | 'friend' | 'benchmark'
+type ChallengeStatus = 'waiting' | 'joined'
+export type LobbyView = 'overview' | 'markets' | 'coach' | 'history'
+
+type ChallengePayload = {
+  marketId: string
+  asset: string
+  interval: string | null
+  question: string
+  expiry: string
+  side: 'UP' | 'DOWN'
+  reason: string
+  confidence: number
+  amount: number
+  wallet: string
+}
+
+type ChallengeRecord = {
+  id: string
+  createdAt: number
+  status: ChallengeStatus
+  marketId: string
+  asset: string
+  interval: string | null
+  question: string
+  expiry: string
+  creator: ChallengePayload
+  opponent: ChallengePayload | null
+}
+
+const duelModes = [
+  { id: 'solo', label: 'Solo lesson', copy: 'Trade, settle, learn' },
+  { id: 'friend', label: 'Reason Duel', copy: 'Same market, no pot' },
+  { id: 'benchmark', label: 'Shadow Coach', copy: 'Compare, do not copy' },
+] as const
+
+async function requestChallenge(path: string, init?: RequestInit): Promise<ChallengeRecord> {
+  const response = await fetch(`/api/challenges${path}`, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+  })
+  const body = await response.json() as ChallengeRecord & { error?: string }
+  if (!response.ok) throw new Error(body.error ?? 'Challenge request failed.')
+  return body
+}
+
+function createChallenge(payload: ChallengePayload) {
+  return requestChallenge('', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+async function listChallenges(): Promise<ChallengeRecord[]> {
+  const response = await fetch('/api/challenges')
+  const body = await response.json() as ChallengeRecord[] & { error?: string }
+  if (!response.ok) throw new Error(body.error ?? 'Challenge list could not be loaded.')
+  return body
+}
+
+function loadChallenge(id: string) {
+  return requestChallenge(`/${encodeURIComponent(id)}`)
+}
+
+function joinChallenge(id: string, payload: ChallengePayload) {
+  return requestChallenge(`/${encodeURIComponent(id)}/join`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+const CHALLENGE_CACHE_KEY = 'signalsprint.challenge-cache.v1'
+
+function readChallengeCache(): ChallengeRecord[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(CHALLENGE_CACHE_KEY) ?? '[]') as ChallengeRecord[]
+    return stored.filter((challenge) => typeof challenge?.id === 'string' && typeof challenge?.marketId === 'string')
+  } catch {
+    return []
+  }
+}
+
+function mergeChallenges(...groups: ChallengeRecord[][]): ChallengeRecord[] {
+  const unique = new Map<string, ChallengeRecord>()
+  for (const group of groups) {
+    for (const challenge of group) unique.set(challenge.id, challenge)
+  }
+  return [...unique.values()].sort((left, right) => right.createdAt - left.createdAt)
+}
+
+function saveChallengeCache(challenges: ChallengeRecord[]) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(CHALLENGE_CACHE_KEY, JSON.stringify(mergeChallenges(challenges).slice(0, 20)))
+  } catch {
+    // The API remains the source of truth if browser storage is unavailable.
+  }
+}
+
+function ChallengeInvite({
+  challenge,
+  available,
+  onJoin,
+}: {
+  challenge: ChallengeRecord
+  available: boolean
+  onJoin: () => void
+}) {
+  return (
+    <section className="coach-inbox-preview" aria-labelledby="challenge-invite-title">
+      <div>
+        <p className="eyebrow">Incoming reason duel</p>
+        <h3 id="challenge-invite-title">A call is waiting.<br /><em>Bring your own view.</em></h3>
+        <p className="coach-inbox-lede">This invite is tied to one live market. You keep your own position and choose your own reason.</p>
+      </div>
+      <article className="coach-message-card">
+        <div className="coach-message-topline">
+          <span className="coach-unread"><span className="status-dot" /> Friend challenge</span>
+          <span>{challenge.asset} · {challenge.interval ?? 'live'}</span>
+        </div>
+        <strong>{challenge.question}</strong>
+        <p>Someone has committed first. The challenge closes with the market, not with a shared pot.</p>
+        <button type="button" className="coach-message-action" onClick={onJoin} disabled={!available}>
+          {available ? 'Open this market' : 'Market no longer live'} <span>-&gt;</span>
+        </button>
+      </article>
+    </section>
+  )
+}
+
+function ChallengeRecordPanel({ challenge }: { challenge: ChallengeRecord }) {
+  const inviteUrl = typeof window === 'undefined' ? `/?challenge=${challenge.id}` : `${window.location.origin}/?challenge=${challenge.id}`
+  return (
+    <div className="trade-result">
+      <span>Reason Duel · {challenge.status === 'joined' ? 'opponent joined' : 'invite ready'}</span>
+      <strong>{challenge.status === 'joined' ? 'Two independent calls recorded.' : 'Share the round after your fill.'}</strong>
+      <small>{challenge.asset} · {challenge.interval ?? 'live'} · same marketId · …{challenge.marketId.slice(-8)}</small>
+      {challenge.status === 'waiting' && <small>Invite link · {inviteUrl}</small>}
+      {challenge.status === 'joined' && challenge.opponent && <small>Opponent wallet · {shortAddress(challenge.opponent.wallet as Address)}</small>}
+      <small>No pooled funds. Each player owns and redeems their own position.</small>
+    </div>
+  )
+}
+
+function DuelBoard({ challenges, onOpen }: { challenges: ChallengeRecord[]; onOpen: (challenge: ChallengeRecord) => void }) {
+  return (
+    <section className="trade-history" aria-labelledby="duel-board-title">
+      <div className="trade-history-heading">
+        <div>
+          <p className="eyebrow">Reason Duel board</p>
+          <h3 id="duel-board-title">Return to the call.</h3>
+        </div>
+        <span>{challenges.length} round{challenges.length === 1 ? '' : 's'}</span>
+      </div>
+      {challenges.length === 0 ? (
+        <p className="trade-history-empty">Create a Reason Duel from any live market and its invite will stay visible here while this session is open.</p>
+      ) : (
+        <div className="trade-history-list">
+          {challenges.map((challenge) => (
+            <article className="trade-history-card" key={challenge.id}>
+              <div className="trade-history-topline">
+                <span>{challenge.asset} · {challenge.interval ?? 'live'}</span>
+                <span>{challenge.status === 'joined' ? 'joined' : 'waiting for a friend'}</span>
+              </div>
+              <strong>{challenge.question}</strong>
+              <small>marketId · …{challenge.marketId.slice(-8)} · {challenge.status === 'joined' ? 'two independent calls recorded' : 'no pooled funds'}</small>
+              <div className="trade-history-actions">
+                <button type="button" onClick={() => onOpen(challenge)}>{challenge.status === 'joined' ? 'View round' : 'Open round'}</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+      <small className="trade-history-note">Browser cache keeps these rounds after a refresh or local server restart. Production still needs authenticated server persistence.</small>
+    </section>
+  )
+}
+
+function OverviewSnapshot({ markets, followUps, challenges, wallet, onViewChange }: { markets: LiveMarketWithBook[]; followUps: CoachFollowUp[]; challenges: ChallengeRecord[]; wallet: WalletState; onViewChange: (view: LobbyView) => void }) {
+  const readyFollowUps = followUps.filter((followUp) => isCoachFollowUpReady(followUp.scheduledAt, Date.now())).length
+  return (
+    <section className="dashboard-snapshot" aria-labelledby="snapshot-title">
+      <div className="dashboard-snapshot-head">
+        <div>
+          <p className="eyebrow">Workspace snapshot</p>
+          <h2 id="snapshot-title">Make one clear call.</h2>
+        </div>
+        <span className="live-indicator"><span className="status-dot" /> live system</span>
+      </div>
+      <div className="dashboard-metrics">
+        <article><span>Live windows</span><strong>{markets.length}</strong><small>DreamDEX markets available</small></article>
+        <article><span>Coach queue</span><strong>{readyFollowUps > 0 ? `${readyFollowUps} ready` : followUps.length}</strong><small>{readyFollowUps > 0 ? 'reviews waiting for you' : 'scheduled reviews'}</small></article>
+        <article><span>Reason Duels</span><strong>{challenges.length}</strong><small>{challenges.length > 0 ? 'rounds in this browser' : 'start from a live market'}</small></article>
+      </div>
+      <div className="dashboard-snapshot-actions">
+        <button className="primary-button" type="button" onClick={() => onViewChange('markets')}>Open live markets <span>-&gt;</span></button>
+        <button className="secondary-button" type="button" onClick={() => onViewChange('coach')}>Open Coach <span>-&gt;</span></button>
+      </div>
+      <p className="dashboard-snapshot-note">{wallet.address ? 'Wallet connected. Each decision remains self-custodied and bounded.' : 'No wallet connected. Start with the rehearsal, then connect only when you are ready to sign.'}</p>
+    </section>
+  )
+}
+
+function BeginnerLesson() {
+  const [practiceSide, setPracticeSide] = useState<PracticeSide | null>(null)
+
+  return (
+    <section className="beginner-lesson" aria-labelledby="beginner-lesson-title">
+      <div className="beginner-lesson-copy">
+        <p className="eyebrow">00 / Start here</p>
+        <h2 id="beginner-lesson-title">Learn the call<br /><em>in one move.</em></h2>
+        <p>Before a wallet or a market, practice the only rule that matters first: compare the close with the open.</p>
+        <span className="lesson-caption">No wallet. No funds. Just one useful idea.</span>
+      </div>
+      <div className="lesson-card">
+        <div className="lesson-card-topline">
+          <span>Practice round</span>
+          <span>45 sec</span>
+        </div>
+        <div className="lesson-price-row">
+          <div><span>Opening price</span><strong>100</strong></div>
+          <div className="lesson-arrow" aria-hidden="true">-&gt;</div>
+          <div><span>Closing price</span><strong>103</strong></div>
+        </div>
+        {!practiceSide ? (
+          <>
+            <p className="lesson-question">If the close is 103 and the open is 100, which side wins?</p>
+            <div className="lesson-choice-grid">
+              {(['UP', 'DOWN'] as const).map((side) => (
+                <button key={side} type="button" className="lesson-choice" onClick={() => setPracticeSide(side)}>
+                  <span>{side}</span>
+                  <small>{side === 'UP' ? 'close >= open' : 'close < open'}</small>
+                </button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <div className={`lesson-feedback ${practiceSide === 'UP' ? 'lesson-feedback-correct' : 'lesson-feedback-coach'}`}>
+            <span>{practiceSide === 'UP' ? 'Nice read.' : 'Useful miss.'}</span>
+            <strong>{practiceSide === 'UP' ? 'UP wins this round.' : 'UP wins this round.'}</strong>
+            <p>
+              {practiceSide === 'UP'
+                ? 'You compared the closing price with the opening price. That is the whole first decision.'
+                : 'With a close of 103 and an open of 100, UP wins. The result is feedback, not a punishment.'}
+            </p>
+            <button type="button" className="lesson-reset" onClick={() => setPracticeSide(null)}>Try another rehearsal</button>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+type CoachFollowUp = {
+  id: string
+  marketId: string
+  asset: string
+  interval: string | null
+  question: string
+  side: 'UP' | 'DOWN'
+  reason: string
+  confidence: number
+  scheduledAt: number
+}
+
+const COACH_FOLLOW_UP_KEY = 'signalsprint.coach-follow-ups.v1'
+
+function readCoachFollowUps(): CoachFollowUp[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(COACH_FOLLOW_UP_KEY) ?? '[]') as CoachFollowUp[]
+    return stored.filter((followUp) => typeof followUp?.id === 'string' && typeof followUp?.scheduledAt === 'number')
+  } catch {
+    return []
+  }
+}
+
+function saveCoachFollowUp(followUp: CoachFollowUp): CoachFollowUp[] {
+  const next = [followUp, ...readCoachFollowUps().filter((item) => item.id !== followUp.id)]
+    .sort((left, right) => right.scheduledAt - left.scheduledAt)
+    .slice(0, 20)
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(COACH_FOLLOW_UP_KEY, JSON.stringify(next))
+    } catch {
+      // The current session still shows the scheduled card if storage is unavailable.
+    }
+  }
+  return next
+}
+
+function formatFollowUpTime(timestamp: number) {
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(timestamp)
+}
+
+export function isCoachFollowUpReady(scheduledAt: number, now: number) {
+  return now >= scheduledAt
+}
+
+function CoachInboxPreview({ followUps, history, onReview }: { followUps: CoachFollowUp[]; history: TradeRecord[]; onReview: (record: TradeRecord) => void }) {
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  return (
+    <section className="coach-inbox-preview" aria-labelledby="coach-inbox-title">
+      <div>
+        <p className="eyebrow">Scheduled follow-up{followUps.length === 0 ? ' · sample' : ''}</p>
+        <h3 id="coach-inbox-title">The market closes.<br /><em>The lesson stays.</em></h3>
+        <p className="coach-inbox-lede">A Coach Inbox turns settlement into one useful next step, even when you have already closed the app. Each confirmed fill schedules a review at expiry.</p>
+      </div>
+      {followUps.length === 0 ? (
+        <article className="coach-message-card">
+          <div className="coach-message-topline">
+            <span className="coach-unread"><span className="status-dot" /> Demo lesson</span>
+            <span>ETH · 15m</span>
+          </div>
+          <strong>Correct direction. Expensive entry.</strong>
+          <p>You called UP and the market settled UP, but your 82c entry left less room for error.</p>
+          <button type="button" className="coach-message-action" onClick={() => setExpanded((current) => current === 'sample' ? null : 'sample')}>
+            {expanded === 'sample' ? 'Hide the lesson' : 'Open the lesson'} <span>{expanded === 'sample' ? '^' : '->'}</span>
+          </button>
+          {expanded === 'sample' && (
+            <div className="coach-message-detail">
+              <span>Next concept</span>
+              <strong>Probability is price, not certainty.</strong>
+              <small>Place a confirmed testnet trade to schedule a real review card at market expiry.</small>
+            </div>
+          )}
+        </article>
+      ) : (
+        <div className="coach-message-list">
+          {followUps.slice(0, 3).map((followUp) => {
+            const ready = isCoachFollowUpReady(followUp.scheduledAt, now)
+            const isExpanded = expanded === followUp.id
+            const matchingRecord = history.find((record) => record.id === followUp.id)
+            return (
+              <article className="coach-message-card" key={followUp.id}>
+                <div className="coach-message-topline">
+                  <span className="coach-unread"><span className="status-dot" /> {ready ? 'Review ready' : 'Review queued'}</span>
+                  <span>{followUp.asset} · {followUp.interval ?? 'live'}</span>
+                </div>
+                <strong>{ready ? 'Come back and score the call.' : 'Your review is queued.'}</strong>
+                <p>{ready ? 'The market window has closed. Compare your direction and confidence with the settled result before checking the payout.' : `Your ${followUp.side} call will become a review lesson at ${formatFollowUpTime(followUp.scheduledAt)}.`}</p>
+                <button type="button" className="coach-message-action" onClick={() => setExpanded(isExpanded ? null : followUp.id)}>
+                  {isExpanded ? 'Hide the record' : 'Open the record'} <span>{isExpanded ? '^' : '->'}</span>
+                </button>
+                {isExpanded && (
+                  <div className="coach-message-detail">
+                    <span>Decision record</span>
+                    <strong>{followUp.side} · {followUp.confidence}% confidence · {followUp.reason}</strong>
+                    <small>{followUp.question} · marketId …{followUp.marketId.slice(-8)}</small>
+                    {ready && matchingRecord && (
+                      <button type="button" className="coach-message-action" onClick={() => onReview(matchingRecord)}>
+                        Review settlement <span>-&gt;</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+              </article>
+            )
+          })}
+        </div>
+      )}
+    </section>
+  )
+}
+
+type WalletState = {
+  client: WalletClient | null
+  address: Address | null
+  chainId: number | null
+  status: 'idle' | 'connecting' | 'connected' | 'wrong-network' | 'error'
+  message: string | null
+}
+
+type WalletSession = { address: Address; chainId: number }
+
+const WALLET_SESSION_KEY = 'signalsprint.wallet-session.v1'
+
+function readWalletSession(): WalletSession | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(WALLET_SESSION_KEY) ?? 'null') as Partial<WalletSession> | null
+    if (typeof stored?.address !== 'string' || typeof stored.chainId !== 'number') return null
+    return { address: stored.address as Address, chainId: stored.chainId }
+  } catch {
+    return null
+  }
+}
+
+function saveWalletSession(address: Address, chainId: number) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(WALLET_SESSION_KEY, JSON.stringify({ address, chainId }))
+  } catch {
+    // Wallet connection remains usable if browser storage is unavailable.
+  }
+}
+
+function clearWalletSession() {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.removeItem(WALLET_SESSION_KEY)
+  } catch {
+    // Nothing else is required when browser storage is unavailable.
+  }
+}
+
+type TradeState = {
+  status: 'idle' | 'preparing' | 'confirmed' | 'error'
+  message: string | null
+  result: IocTradeResult | null
+}
+
+const initialTradeState: TradeState = { status: 'idle', message: null, result: null }
+
+type SettlementState = {
+  status: 'idle' | 'loading' | 'ready' | 'redeeming' | 'error'
+  message: string | null
+  snapshot: SettlementSnapshot | null
+  redemptionHash: string | null
+}
+
+type TradeRecord = WalletTradeRecord
+
+const TRADE_HISTORY_KEY = 'signalsprint.trade-history.v1'
+
+const VERIFIED_REPLAY = {
+  marketId: '0x000000000000000000000000000000000000000000000000000000000000e3fb' as Hex,
+  asset: 'ETH',
+  interval: '15m',
+  question: 'ETH closes at or above its opening price',
+  outcome: 'UP / YES',
+  fillAmount: '5.00',
+  fillPrice: '64.2¢',
+  tradeHash: '0x64a656c2b4410d5d05456d33b80b78fc55e3002045e7e8a1d2d26e721b01f099',
+  redemptionHash: '0x5eb9f2f0b9779520de6f581d2aea9d63e3a4415d8f4383d1084473f23a53d30e',
+} as const
+
+const initialSettlementState: SettlementState = {
+  status: 'idle',
+  message: null,
+  snapshot: null,
+  redemptionHash: null,
+}
+
+function shortAddress(address: Address) {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`
+}
+
+function WalletDock({
+  wallet,
+  onConnect,
+  onSwitchChain,
+  onDisconnect,
+}: {
+  wallet: WalletState
+  onConnect: () => void
+  onSwitchChain: () => void
+  onDisconnect: () => void
+}) {
+  const connectedAddress = wallet.status === 'connected' ? wallet.address : null
+  return (
+    <section className="wallet-dock" aria-label="Wallet connection">
+      <div className="wallet-dock-copy">
+        <span className="eyebrow">Wallet session</span>
+        {connectedAddress ? (
+          <strong>{shortAddress(connectedAddress)}</strong>
+        ) : (
+          <strong>{wallet.status === 'connecting' ? 'Reconnecting…' : 'Not connected'}</strong>
+        )}
+        <small className={wallet.status === 'error' ? 'wallet-dock-error' : undefined}>
+          {wallet.status === 'error' && wallet.message
+            ? wallet.message
+            : connectedAddress
+              ? 'Somnia testnet · self-custody'
+              : 'Connect once to keep your workspace ready'}
+        </small>
+      </div>
+      <div className="wallet-dock-actions">
+        {wallet.status === 'wrong-network' ? (
+          <button className="wallet-dock-button" type="button" onClick={onSwitchChain}>Switch network</button>
+        ) : connectedAddress ? (
+          <button className="wallet-dock-button wallet-dock-button-muted" type="button" onClick={onDisconnect}>Disconnect</button>
+        ) : (
+          <button className="wallet-dock-button" type="button" onClick={onConnect} disabled={wallet.status === 'connecting'}>
+            {wallet.status === 'connecting' ? 'Reconnecting…' : 'Connect wallet'}
+          </button>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function readTradeHistory(address: Address): TradeRecord[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(TRADE_HISTORY_KEY) ?? '[]') as TradeRecord[]
+    return stored.filter((record) => typeof record.wallet === 'string' && record.wallet.toLowerCase() === address.toLowerCase())
+  } catch {
+    return []
+  }
+}
+
+function tradeHistoryKey(record: TradeRecord) {
+  return `${record.hash.toLowerCase()}:${record.marketId.toLowerCase()}:${record.outcome}`
+}
+
+function mergeTradeHistory(...groups: TradeRecord[][]): TradeRecord[] {
+  const unique = new Map<string, TradeRecord>()
+  for (const group of groups) {
+    for (const record of group) unique.set(tradeHistoryKey(record), record)
+  }
+  return [...unique.values()].sort((left, right) => right.createdAt - left.createdAt)
+}
+
+function enrichTradeRecord(record: TradeRecord, snapshot: SettlementSnapshot): TradeRecord {
+  const score = evaluateDecisionScore({
+    outcome: record.outcome,
+    confidence: record.confidence,
+    fillPrice: record.averageFillPrice,
+    filledAmount: record.filledAmount,
+    isResolved: snapshot.isResolved,
+    isVoided: snapshot.isVoided,
+    winningOutcome: snapshot.winningOutcome,
+  })
+  return {
+    ...record,
+    settlement: {
+      stage: snapshot.stage,
+      isResolved: snapshot.isResolved,
+      isVoided: snapshot.isVoided,
+      winningOutcome: snapshot.winningOutcome,
+      checkedAt: Date.now(),
+    },
+    decisionResult: score.result,
+    decisionScore: score.decisionScore,
+    marketRelativeDelta: score.marketRelativeDelta,
+  }
+}
+
+function saveTradeRecord(record: TradeRecord): TradeRecord[] {
+  if (typeof window === 'undefined') return [record]
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(TRADE_HISTORY_KEY) ?? '[]') as TradeRecord[]
+    const next = [record, ...stored.filter((item) => item.id !== record.id && item.hash !== record.hash)].slice(0, 30)
+    window.localStorage.setItem(TRADE_HISTORY_KEY, JSON.stringify(next))
+    return next.filter((item) => item.wallet.toLowerCase() === record.wallet.toLowerCase())
+  } catch {
+    return [record]
+  }
+}
+
+function formatTradeDate(timestamp: number) {
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(timestamp)
+}
+
+function VerifiedReplay() {
+  return (
+    <section className="trade-history replay-panel" aria-labelledby="replay-title">
+      <div className="trade-history-heading">
+        <div>
+          <p className="eyebrow">Demo replay · read only</p>
+          <h3 id="replay-title">One round, fully proven.</h3>
+        </div>
+        <span>no wallet required</span>
+      </div>
+      <p className="trade-history-empty">A captured ETH 15m round replayed from immutable testnet evidence. This view never creates a new order.</p>
+      <div className="composer-market">
+        <span>{VERIFIED_REPLAY.asset} · {VERIFIED_REPLAY.interval} · Redeemed</span>
+        <strong>{VERIFIED_REPLAY.question}</strong>
+        <small>marketId · …{VERIFIED_REPLAY.marketId.slice(-8)}</small>
+      </div>
+      <div className="risk-preview" aria-label="Verified replay result">
+        <div><span>Decision</span><strong>{VERIFIED_REPLAY.outcome}</strong></div>
+        <div><span>Filled</span><strong>{VERIFIED_REPLAY.fillAmount} contracts</strong></div>
+        <div><span>Entry</span><strong>{VERIFIED_REPLAY.fillPrice}</strong></div>
+        <div><span>Redeemed</span><strong>5.00 tUSDC</strong></div>
+      </div>
+      <div className="trade-history-actions">
+        <a href={`${somniaShannon.blockExplorers.default.url}/tx/${VERIFIED_REPLAY.tradeHash}`} target="_blank" rel="noreferrer">View trade receipt ↗</a>
+        <a href={`${somniaShannon.blockExplorers.default.url}/tx/${VERIFIED_REPLAY.redemptionHash}`} target="_blank" rel="noreferrer">View redemption ↗</a>
+      </div>
+      <small className="trade-history-note">Replay evidence is labeled separately from live activity and is not counted as a new trade.</small>
+    </section>
+  )
+}
+
+function describeTradeError(cause: unknown) {
+  const message = cause instanceof Error ? cause.message : 'Trade was not completed.'
+  if (message.includes('ImmediateOrCancelNoFill')) {
+    return 'The live book changed before the IOC could fill. No position was created; choose the market again and retry.'
+  }
+  return message
+}
+
+async function addSomniaTestnet(client: WalletClient) {
+  await client.request({
+    method: 'wallet_addEthereumChain',
+    params: [{
+      chainId: `0x${somniaShannon.id.toString(16)}`,
+      chainName: somniaShannon.name,
+      nativeCurrency: somniaShannon.nativeCurrency,
+      rpcUrls: [...somniaShannon.rpcUrls.default.http],
+      blockExplorerUrls: [somniaShannon.blockExplorers.default.url],
+    }],
+  })
+}
+
+function SettlementRail({
+  settlement,
+  onCheckSettlement,
+  onRedeem,
+}: {
+  settlement: SettlementState
+  onCheckSettlement: () => void
+  onRedeem: (outcomeIdx: OutcomeIndex) => void
+}) {
+  return (
+    <div className="settlement-panel">
+      <div className="settlement-heading">
+        <span>Settlement rail</span>
+        <strong>{settlement.snapshot?.stage ?? 'Not checked'}</strong>
+      </div>
+      <p>Re-read the market by `marketId` after expiry. Claims stay disabled until the chain fixes the outcome.</p>
+      <button className="settlement-check" type="button" onClick={onCheckSettlement} disabled={settlement.status === 'loading' || settlement.status === 'redeeming'}>
+        {settlement.status === 'loading' ? 'Checking settlement…' : 'Check settlement'}
+      </button>
+      {settlement.snapshot && (
+        <>
+          <div className="settlement-balances">
+            <div><span>UP held</span><strong>{settlement.snapshot.yesBalance.toString()}</strong></div>
+            <div><span>DOWN held</span><strong>{settlement.snapshot.noBalance.toString()}</strong></div>
+          </div>
+          {settlement.snapshot.stage === 'Trading' || settlement.snapshot.stage === 'Locked' ? (
+            <small className="settlement-muted">No outcome is claimable yet. Check again after the market resolves.</small>
+          ) : settlement.snapshot.claimable.length > 0 ? (
+            <div className="claim-list">
+              {settlement.snapshot.claimable.map((position) => (
+                <button key={position.outcomeIdx} className="claim-button" type="button" onClick={() => onRedeem(position.outcomeIdx)} disabled={settlement.status === 'redeeming'}>
+                  {settlement.status === 'redeeming' ? 'Waiting for wallet…' : `Redeem ${position.label}`} <span>{position.balance.toString()}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <small className="settlement-muted">No claimable held outcome. Losing sides are intentionally blocked.</small>
+          )}
+        </>
+      )}
+      {settlement.message && <small className={settlement.status === 'error' ? 'settlement-error' : 'settlement-muted'}>{settlement.message}</small>}
+      {settlement.redemptionHash && (
+        <a className="redemption-link" href={`${somniaShannon.blockExplorers.default.url}/tx/${settlement.redemptionHash}`} target="_blank" rel="noreferrer">View redemption receipt ↗</a>
+      )}
+    </div>
+  )
+}
+
+function DecisionComposer({
+  market,
+  wallet,
+  trade,
+  settlement,
+  challenge,
+  defaultMode = 'solo',
+  onConnect,
+  onSwitchChain,
+  onExecute,
+  onCheckSettlement,
+  onRedeem,
+  onClose,
+}: {
+  market: LiveMarketWithBook
+  wallet: WalletState
+  trade: TradeState
+  settlement: SettlementState
+  challenge: ChallengeRecord | null
+  defaultMode?: DuelMode
+  onConnect: () => void
+  onSwitchChain: () => void
+  onExecute: (outcome: 'UP' | 'DOWN', amount: number, confidence: number, thesis: string, mode: DuelMode) => void
+  onCheckSettlement: () => void
+  onRedeem: (outcomeIdx: OutcomeIndex) => void
+  onClose: () => void
+}) {
+  const [outcome, setOutcome] = useState<'UP' | 'DOWN'>('UP')
+  const [amount, setAmount] = useState(5)
+  const [confidence, setConfidence] = useState(55)
+  const [thesis, setThesis] = useState<ReasonId>(reasonCards[0].id)
+  const [duelMode, setDuelMode] = useState<DuelMode>(defaultMode)
+  const book = normalizeBook(market.book, market.quoteDecimals)
+  const entryPrice = outcome === 'UP'
+    ? book.bestAsk
+    : book.bestBid === null ? null : 1 - book.bestBid
+  const estimatedCost = entryPrice === null ? null : amount * entryPrice
+  const estimatedProfit = estimatedCost === null ? null : amount - estimatedCost
+  const formatTokens = (value: number | null) => value === null ? '—' : value.toFixed(2)
+
+  return (
+    <div className="composer-backdrop">
+      <aside className="composer" role="dialog" aria-modal="true" aria-labelledby="composer-title">
+        <div className="composer-head">
+          <div>
+            <p className="eyebrow">02 / Decision composer</p>
+            <h2 id="composer-title">Make the call.</h2>
+          </div>
+          <button className="composer-close" type="button" onClick={onClose} aria-label="Close decision composer">×</button>
+        </div>
+
+        <div className="composer-market">
+          <span>{market.asset} · {market.interval}</span>
+          <strong>{market.question}</strong>
+          <small>marketId · …{market.marketId.slice(-8)}</small>
+        </div>
+
+        <div className="mode-field">
+          <div className="mode-heading">
+            <span>How do you want to learn?</span>
+            <small>choose a round</small>
+          </div>
+          <div className="mode-grid">
+            {duelModes.map((mode) => (
+              <button
+                key={mode.id}
+                type="button"
+                className={`mode-option ${duelMode === mode.id ? 'selected' : ''}`}
+                onClick={() => setDuelMode(mode.id)}
+              >
+                <strong>{mode.label}</strong>
+                <small>{mode.copy}</small>
+              </button>
+            ))}
+          </div>
+          {duelMode === 'friend' && (
+            <p className="mode-note"><strong>No shared pot.</strong> You and your friend each keep your own DreamDEX position. The winner is the settled direction; the lesson score is separate.</p>
+          )}
+          {duelMode === 'benchmark' && (
+            <p className="mode-note"><strong>Read-only comparison.</strong> The Shadow Coach never trades or gives financial advice. It is a fixed reference for your post-settlement lesson.</p>
+          )}
+        </div>
+
+        <fieldset className="outcome-picker">
+          <legend>Your outcome</legend>
+          <button className={outcome === 'UP' ? 'selected' : ''} type="button" onClick={() => setOutcome('UP')}>
+            <span>UP / YES</span><strong>{book.bestAsk === null ? '—' : `${Math.round(book.bestAsk * 100)}¢`}</strong>
+          </button>
+          <button className={outcome === 'DOWN' ? 'selected' : ''} type="button" onClick={() => setOutcome('DOWN')}>
+            <span>DOWN / NO</span><strong>{book.bestBid === null ? '—' : `${Math.round((1 - book.bestBid) * 100)}¢`}</strong>
+          </button>
+        </fieldset>
+
+        <label className="composer-field">
+          <span>Outcome contracts <small>max 10</small></span>
+          <input type="number" min="1" max="10" step="1" value={amount} onChange={(event) => setAmount(Math.min(10, Math.max(1, Number(event.target.value))))} />
+        </label>
+
+        <div className="composer-field reason-field">
+          <span>Why this side? <small>pick one reason</small></span>
+          <div className="reason-card-grid">
+            {reasonCards.map((reason) => (
+              <button
+                key={reason.id}
+                type="button"
+                className={`reason-card ${thesis === reason.id ? 'selected' : ''}`}
+                onClick={() => setThesis(reason.id)}
+              >
+                <strong>{reason.label}</strong>
+                <small>{reason.copy}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="composer-field confidence-field">
+          <span>How sure are you? <small>self-reported</small></span>
+          <div className="confidence-grid">
+            {confidenceBands.map((band) => (
+              <button
+                key={band.label}
+                type="button"
+                className={`confidence-option ${confidence === band.value ? 'selected' : ''}`}
+                onClick={() => setConfidence(band.value)}
+              >
+                <strong>{band.label}</strong>
+                <small>{band.copy}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="risk-preview" aria-label="Risk preview">
+          <div><span>Estimated cost</span><strong>{formatTokens(estimatedCost)} tUSDC</strong></div>
+          <div><span>Maximum loss</span><strong>{formatTokens(estimatedCost)} tUSDC</strong></div>
+          <div><span>Profit if correct</span><strong>{formatTokens(estimatedProfit)} tUSDC</strong></div>
+          <div><span>Payout if correct</span><strong>{amount.toFixed(2)} tUSDC</strong></div>
+        </div>
+
+        <p className="testnet-notice">Testnet practice only. The final price and fill can change before wallet confirmation.</p>
+        <p className="commitment-note">When you sign, your side, reason, confidence, and maximum loss become this round's decision record.</p>
+        {challenge && <ChallengeRecordPanel challenge={challenge} />}
+        {wallet.status === 'connected' && wallet.address ? (
+          <>
+            <div className="wallet-connected">
+              <span>Wallet connected</span>
+              <strong>{shortAddress(wallet.address)}</strong>
+              <small>{trade.status === 'preparing' ? 'Checking market, balance, and live liquidity.' : 'Ready to sign a bounded IOC order.'}</small>
+            </div>
+            <button
+              className="composer-submit"
+              type="button"
+              disabled={trade.status === 'preparing' || trade.status === 'confirmed' || entryPrice === null}
+              onClick={() => onExecute(outcome, amount, confidence, thesis, duelMode)}
+            >
+              {trade.status === 'preparing'
+                ? 'Preparing trade…'
+                : trade.status === 'confirmed'
+                  ? 'Trade confirmed'
+                  : `Place ${amount} ${outcome === 'UP' ? 'YES' : 'NO'} contracts`}
+            </button>
+          </>
+        ) : wallet.status === 'wrong-network' ? (
+          <button className="composer-submit" type="button" onClick={onSwitchChain}>Switch to Somnia testnet</button>
+        ) : (
+          <button className="composer-submit" type="button" onClick={onConnect} disabled={wallet.status === 'connecting'}>
+            {wallet.status === 'connecting' ? 'Connecting wallet…' : 'Connect wallet to continue'}
+          </button>
+        )}
+        {wallet.message && <p className={`wallet-message ${wallet.status === 'error' ? 'wallet-error' : ''}`}>{wallet.message}</p>}
+        {trade.message && <p className={`wallet-message ${trade.status === 'error' ? 'wallet-error' : ''}`}>{trade.message}</p>}
+        {trade.result && (
+          <div className="trade-result">
+            <span>On-chain receipt</span>
+            <strong>{trade.result.filledAmount.toFixed(2)} / {trade.result.requestedAmount.toFixed(2)} filled</strong>
+            {trade.result.averageFillPrice !== null && <small>average fill · {(trade.result.averageFillPrice * 100).toFixed(1)}¢</small>}
+            <a href={`${somniaShannon.blockExplorers.default.url}/tx/${trade.result.hash}`} target="_blank" rel="noreferrer">View transaction ↗</a>
+          </div>
+        )}
+        {trade.result && wallet.address && <SettlementRail settlement={settlement} onCheckSettlement={onCheckSettlement} onRedeem={onRedeem} />}
+      </aside>
+    </div>
+  )
+}
+
+function TradeHistoryPanel({
+  history,
+  settlements,
+  onReview,
+}: {
+  history: TradeRecord[]
+  settlements: Map<string, SettlementSnapshot>
+  onReview: (record: TradeRecord) => void
+}) {
+  const metrics = buildPassportMetrics(history.map((record) => ({
+    filledAmount: record.filledAmount,
+    cost: record.averageFillPrice === null ? 0 : record.filledAmount * record.averageFillPrice,
+    score: evaluateDecisionScore({
+      outcome: record.outcome,
+      confidence: record.confidence,
+      fillPrice: record.averageFillPrice,
+      filledAmount: record.filledAmount,
+      isResolved: settlements.get(record.marketId.toLowerCase())?.isResolved ?? record.settlement?.isResolved ?? false,
+      isVoided: settlements.get(record.marketId.toLowerCase())?.isVoided ?? record.settlement?.isVoided ?? false,
+      winningOutcome: settlements.get(record.marketId.toLowerCase())?.winningOutcome ?? record.settlement?.winningOutcome,
+    }),
+    realizedPayout: null,
+  })))
+
+  return (
+    <section className="trade-history" aria-labelledby="trade-history-title">
+      <div className="trade-history-heading">
+        <div>
+          <p className="eyebrow">Your decision receipts</p>
+          <h3 id="trade-history-title">Keep the proof.</h3>
+        </div>
+        <span>{history.length} saved round{history.length === 1 ? '' : 's'}</span>
+      </div>
+      {history.length === 0 ? (
+        <p className="trade-history-empty">Your confirmed trades will stay here for this wallet, even after you close the composer.</p>
+      ) : (
+        <div className="trade-history-list">
+          {history.map((record) => (
+              <article className="trade-history-card" key={record.id}>
+              <div className="trade-history-topline">
+                <span>{record.asset} · {record.interval ?? 'live'}</span>
+                <time dateTime={new Date(record.createdAt).toISOString()}>{formatTradeDate(record.createdAt)}</time>
+              </div>
+              <strong>{record.outcome === 'UP' ? 'UP / YES' : 'DOWN / NO'} · {record.filledAmount.toFixed(2)} contracts filled</strong>
+              <small>{record.question}</small>
+              <div className="trade-history-actions">
+                <a href={`${somniaShannon.blockExplorers.default.url}/tx/${record.hash}`} target="_blank" rel="noreferrer">View transaction ↗</a>
+                <button type="button" onClick={() => onReview(record)}>Review settlement</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+      <div className="risk-preview passport-summary" aria-label="Decision passport summary">
+        <div><span>Rounds</span><strong>{metrics.rounds}</strong></div>
+        <div><span>Resolved sample</span><strong>{metrics.resolvedRounds}</strong></div>
+        <div><span>Win rate</span><strong>{metrics.winRate === null ? '—' : `${Math.round(metrics.winRate * 100)}%`}</strong></div>
+        <div><span>Known at risk</span><strong>{metrics.totalAtRisk.toFixed(2)} tUSDC</strong></div>
+      </div>
+      <small className="trade-history-note">Win rate and calibration exclude unresolved and void rounds. Scored sample: {metrics.calibrationSampleSize}.</small>
+      <small className="trade-history-note">Wallet-scoped history is synced from chain fills and local receipts; every round stays linked to its `marketId` and transaction receipt.</small>
+    </section>
+  )
+}
+
+function DecisionReceipt({ record, snapshot }: { record: TradeRecord; snapshot: SettlementSnapshot | null }) {
+  if (!snapshot) {
+    return <div className="trade-result"><span>Decision result</span><strong>Check settlement to reveal the result.</strong></div>
+  }
+
+  const score = evaluateDecisionScore({
+    outcome: record.outcome,
+    confidence: record.confidence,
+    fillPrice: record.averageFillPrice,
+    filledAmount: record.filledAmount,
+    isResolved: snapshot.isResolved,
+    isVoided: snapshot.isVoided,
+    winningOutcome: snapshot.winningOutcome,
+  })
+  const resultLabel = score.result === 'WIN'
+    ? 'Won'
+    : score.result === 'LOSS'
+      ? 'Lost'
+      : score.result === 'VOID'
+        ? 'Voided / refunded path'
+        : score.result === 'NO_FILL'
+          ? 'No fill'
+          : 'Awaiting final outcome'
+
+  return (
+    <div className="trade-result">
+      <span>Decision result · {snapshot.stage}</span>
+      <strong>{resultLabel}</strong>
+      {score.decisionScore !== null && <small>decision score · {score.decisionScore}/100</small>}
+      {score.marketRelativeDelta !== null && <small>market-relative delta · {score.marketRelativeDelta >= 0 ? '+' : ''}{score.marketRelativeDelta.toFixed(3)}</small>}
+      {record.confidence === undefined
+        ? <small>self-reported confidence was not captured for this imported fill</small>
+        : <small>self-reported confidence · {record.confidence}%{record.thesis ? ` · ${record.thesis}` : ''}</small>}
+      <small>Score formula: 100 × (1 − Brier loss). One round is not proof of future performance.</small>
+    </div>
+  )
+}
+
+function TradeReview({
+  record,
+  settlement,
+  onCheckSettlement,
+  onRedeem,
+  onClose,
+}: {
+  record: TradeRecord
+  settlement: SettlementState
+  onCheckSettlement: () => void
+  onRedeem: (outcomeIdx: OutcomeIndex) => void
+  onClose: () => void
+}) {
+  return (
+    <div className="composer-backdrop">
+      <aside className="composer" role="dialog" aria-modal="true" aria-labelledby="review-title">
+        <div className="composer-head">
+          <div>
+            <p className="eyebrow">03 / Trade receipt</p>
+            <h2 id="review-title">Review the round.</h2>
+          </div>
+          <button className="composer-close" type="button" onClick={onClose} aria-label="Close trade review">×</button>
+        </div>
+        <div className="composer-market">
+          <span>{record.asset} · {record.interval}</span>
+          <strong>{record.question}</strong>
+          <small>marketId · …{record.marketId.slice(-8)}</small>
+        </div>
+        <div className="trade-result">
+          <span>On-chain receipt</span>
+          <strong>{record.filledAmount.toFixed(2)} / {record.requestedAmount.toFixed(2)} filled</strong>
+          {record.averageFillPrice !== null && <small>average fill · {(record.averageFillPrice * 100).toFixed(1)}¢</small>}
+          <a href={`${somniaShannon.blockExplorers.default.url}/tx/${record.hash}`} target="_blank" rel="noreferrer">View transaction ↗</a>
+        </div>
+        <DecisionReceipt record={record} snapshot={settlement.snapshot} />
+        <SettlementRail settlement={settlement} onCheckSettlement={onCheckSettlement} onRedeem={onRedeem} />
+      </aside>
+    </div>
+  )
+}
+
+export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewChange: (view: LobbyView) => void }) {
+  const [markets, setMarkets] = useState<LiveMarketWithBook[]>([])
+  const [diagnostics, setDiagnostics] = useState<{ scanned: number; checked: number; bookCoverage: number } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [selectedMarket, setSelectedMarket] = useState<LiveMarketWithBook | null>(null)
+  const [incomingChallenge, setIncomingChallenge] = useState<ChallengeRecord | null>(null)
+  const [activeChallenge, setActiveChallenge] = useState<ChallengeRecord | null>(null)
+  const [challenges, setChallenges] = useState<ChallengeRecord[]>([])
+  const [challengeError, setChallengeError] = useState<string | null>(null)
+  const [trade, setTrade] = useState<TradeState>(initialTradeState)
+  const [settlement, setSettlement] = useState<SettlementState>(initialSettlementState)
+  const [history, setHistory] = useState<TradeRecord[]>([])
+  const [historySettlements, setHistorySettlements] = useState<Map<string, SettlementSnapshot>>(new Map())
+  const [followUps, setFollowUps] = useState<CoachFollowUp[]>([])
+  const [reviewRecord, setReviewRecord] = useState<TradeRecord | null>(null)
+  const [reviewSettlement, setReviewSettlement] = useState<SettlementState>(initialSettlementState)
+  const [wallet, setWallet] = useState<WalletState>(() => {
+    const session = readWalletSession()
+    return {
+      client: null,
+      address: session?.address ?? null,
+      chainId: session?.chainId ?? null,
+      status: session ? 'connecting' : 'idle',
+      message: null,
+    }
+  })
+
+  useEffect(() => {
+    const provider = window.ethereum
+    const session = readWalletSession()
+    if (!session) return
+    if (!provider) {
+      setWallet((current) => ({ ...current, status: 'error', message: 'Wallet provider unavailable. Reconnect your browser wallet to continue.' }))
+      return
+    }
+
+    let active = true
+    const syncWallet = async () => {
+      const client = createWalletClient({ chain: somniaShannon, transport: custom(provider) })
+      const [address] = await client.getAddresses()
+      if (!address) {
+        clearWalletSession()
+        if (active) setWallet({ client: null, address: null, chainId: null, status: 'idle', message: null })
+        return
+      }
+      const chainId = await client.getChainId()
+      saveWalletSession(address, chainId)
+      if (active) {
+        setWallet({
+          client,
+          address,
+          chainId,
+          status: chainId === somniaShannon.id ? 'connected' : 'wrong-network',
+          message: chainId === somniaShannon.id ? null : `Wallet is on chain ${chainId}; SignalSprint requires Somnia testnet.`,
+        })
+      }
+    }
+    const handleAccountsChanged: ProviderListener = () => {
+      if (readWalletSession()) void syncWallet()
+    }
+    const handleChainChanged: ProviderListener = () => {
+      if (readWalletSession()) void syncWallet()
+    }
+
+    void syncWallet().catch((cause: unknown) => {
+      if (active) setWallet((current) => ({ ...current, status: 'error', message: cause instanceof Error ? cause.message : 'Saved wallet could not be restored.' }))
+    })
+    provider.on?.('accountsChanged', handleAccountsChanged)
+    provider.on?.('chainChanged', handleChainChanged)
+    return () => {
+      active = false
+      provider.removeListener?.('accountsChanged', handleAccountsChanged)
+      provider.removeListener?.('chainChanged', handleChainChanged)
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    const cachedChallenges = readChallengeCache()
+    setChallenges(cachedChallenges)
+    listChallenges()
+      .then((records) => {
+        const merged = mergeChallenges(records, readChallengeCache())
+        saveChallengeCache(merged)
+        if (active) setChallenges(merged)
+      })
+      .catch((cause: unknown) => {
+        if (active && cachedChallenges.length === 0) {
+          setChallengeError(cause instanceof Error ? cause.message : 'Challenge board could not be loaded.')
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    setFollowUps(readCoachFollowUps())
+  }, [])
+
+  useEffect(() => {
+    if (!wallet.address) {
+      setHistory([])
+      setHistorySettlements(new Map())
+      return
+    }
+
+    let active = true
+    const address = wallet.address
+    const localHistory = readTradeHistory(address)
+    setHistory(localHistory)
+
+    async function syncHistory() {
+      let records = localHistory
+      try {
+        const remoteHistory = await listWalletTradeHistory(address)
+        records = mergeTradeHistory(remoteHistory, readTradeHistory(address))
+      } catch {
+        // Keep locally saved receipts visible while the indexer is unavailable.
+      }
+      if (!active) return
+      setHistory(records)
+
+      const snapshots = await listWalletSettlementHistory({
+        address,
+        marketIds: records.map((record) => record.marketId),
+      })
+      if (active) {
+        const settlements = new Map(snapshots.map((snapshot) => [snapshot.market.marketId.toLowerCase(), snapshot]))
+        const hydratedRecords = records.map((record) => {
+          const snapshot = settlements.get(record.marketId.toLowerCase())
+          if (!snapshot) return record
+          const hydrated = enrichTradeRecord(record, snapshot)
+          saveTradeRecord(hydrated)
+          return hydrated
+        })
+        setHistory(hydratedRecords)
+        setHistorySettlements(settlements)
+      }
+    }
+
+    void syncHistory()
+
+    return () => {
+      active = false
+    }
+  }, [wallet.address])
+
+  useEffect(() => {
+    const challengeId = new URLSearchParams(window.location.search).get('challenge')
+    if (!challengeId) return
+    let active = true
+    loadChallenge(challengeId)
+      .then((challenge) => {
+        saveChallengeCache([challenge, ...readChallengeCache()])
+        if (active) {
+          setIncomingChallenge(challenge)
+          setChallenges((current) => mergeChallenges([challenge], current))
+          onViewChange('coach')
+        }
+      })
+      .catch((cause: unknown) => {
+        const cachedChallenge = readChallengeCache().find((challenge) => challenge.id === challengeId)
+        if (active && cachedChallenge) {
+          setIncomingChallenge(cachedChallenge)
+          setChallenges((current) => mergeChallenges([cachedChallenge], current))
+        } else if (active) {
+          setChallengeError(cause instanceof Error ? cause.message : 'This challenge could not be loaded.')
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  function openChallenge(challenge: ChallengeRecord) {
+    const market = markets.find((candidate) => candidate.marketId.toLowerCase() === challenge.marketId.toLowerCase())
+    if (!market) {
+      setChallengeError('This market is no longer live. The invite can no longer be joined.')
+      return
+    }
+    setActiveChallenge(challenge)
+    setTrade(initialTradeState)
+    setSettlement(initialSettlementState)
+    setSelectedMarket(market)
+    onViewChange('markets')
+  }
+
+  function openIncomingChallenge() {
+    if (!incomingChallenge) return
+    openChallenge(incomingChallenge)
+  }
+
+  async function connectWallet() {
+    const provider = window.ethereum
+    if (!provider) {
+      setWallet((current) => ({ ...current, status: 'error', message: 'Install a browser wallet to continue.' }))
+      return
+    }
+
+    setWallet((current) => ({ ...current, status: 'connecting', message: null }))
+    try {
+      const client = createWalletClient({ chain: somniaShannon, transport: custom(provider) })
+      const [address] = await client.requestAddresses()
+      const chainId = await client.getChainId()
+      saveWalletSession(address, chainId)
+      setWallet({
+        client,
+        address,
+        chainId,
+        status: chainId === somniaShannon.id ? 'connected' : 'wrong-network',
+        message: chainId === somniaShannon.id ? null : `Wallet is on chain ${chainId}; SignalSprint requires Somnia testnet.`,
+      })
+    } catch (cause: unknown) {
+      setWallet((current) => ({
+        ...current,
+        status: 'error',
+        message: cause instanceof Error ? cause.message : 'Wallet connection was not completed.',
+      }))
+    }
+  }
+
+  async function switchWalletChain() {
+    if (!wallet.client) return
+    try {
+      try {
+        await wallet.client.switchChain({ id: somniaShannon.id })
+      } catch {
+        await addSomniaTestnet(wallet.client)
+        await wallet.client.switchChain({ id: somniaShannon.id })
+      }
+      const chainId = await wallet.client.getChainId()
+      if (wallet.address) saveWalletSession(wallet.address, chainId)
+      setWallet((current) => ({
+        ...current,
+        chainId,
+        status: chainId === somniaShannon.id ? 'connected' : 'wrong-network',
+        message: chainId === somniaShannon.id ? null : `Wallet is on chain ${chainId}; SignalSprint requires Somnia testnet.`,
+      }))
+    } catch (cause: unknown) {
+      setWallet((current) => ({ ...current, status: 'error', message: cause instanceof Error ? cause.message : 'Network switch was not completed.' }))
+    }
+  }
+
+  function disconnectWallet() {
+    clearWalletSession()
+    setWallet({ client: null, address: null, chainId: null, status: 'idle', message: null })
+    setHistory([])
+    setHistorySettlements(new Map())
+  }
+
+  async function executeTrade(outcome: 'UP' | 'DOWN', amount: number, confidence: number, thesis: string, mode: DuelMode) {
+    if (!wallet.client || !wallet.address || wallet.status !== 'connected' || !selectedMarket) return
+    setTrade({ status: 'preparing', message: null, result: null })
+    setSettlement(initialSettlementState)
+    try {
+      const result = await executeIocOrder({
+        marketId: selectedMarket.marketId,
+        outcome,
+        amount,
+        address: wallet.address,
+        walletClient: wallet.client,
+      })
+      setTrade({
+        status: 'confirmed',
+        message: result.filledAmount > 0
+          ? `Confirmed: ${result.filledAmount.toFixed(2)} contracts filled.`
+          : 'Confirmed on-chain, but the IOC found no matching contracts.',
+        result,
+      })
+      setHistory(saveTradeRecord({
+        id: result.hash,
+        hash: result.hash,
+        wallet: wallet.address.toLowerCase(),
+        marketId: selectedMarket.marketId,
+        asset: selectedMarket.asset,
+        interval: selectedMarket.interval ?? null,
+        question: selectedMarket.question,
+        outcome,
+        requestedAmount: result.requestedAmount,
+        filledAmount: result.filledAmount,
+        averageFillPrice: result.averageFillPrice,
+        createdAt: Date.now(),
+        confidence,
+        thesis,
+      }))
+
+      if (result.filledAmount > 0) {
+        const scheduledAt = Number(selectedMarket.expiry) * 1000
+        if (Number.isFinite(scheduledAt)) {
+          setFollowUps(saveCoachFollowUp({
+            id: result.hash,
+            marketId: selectedMarket.marketId,
+            asset: selectedMarket.asset,
+            interval: selectedMarket.interval ?? null,
+            question: selectedMarket.question,
+            side: outcome,
+            reason: thesis,
+            confidence,
+            scheduledAt,
+          }))
+        }
+      }
+
+      if (mode === 'friend' && result.filledAmount > 0) {
+        const payload: ChallengePayload = {
+          marketId: selectedMarket.marketId,
+          asset: selectedMarket.asset,
+          interval: selectedMarket.interval ?? null,
+          question: selectedMarket.question,
+          expiry: selectedMarket.expiry,
+          side: outcome,
+          reason: thesis,
+          confidence,
+          amount: result.filledAmount,
+          wallet: wallet.address.toLowerCase(),
+        }
+        try {
+          const challenge = incomingChallenge
+            ? await joinChallenge(incomingChallenge.id, payload)
+            : await createChallenge(payload)
+          saveChallengeCache([challenge, ...readChallengeCache()])
+          setActiveChallenge(challenge)
+          setChallenges((current) => mergeChallenges([challenge], current))
+          if (incomingChallenge) setIncomingChallenge(challenge)
+          setTrade((current) => ({
+            ...current,
+            message: incomingChallenge ? 'Duel joined. Your independent position is recorded.' : 'Duel created. Share the invite link with your friend.',
+          }))
+        } catch (cause: unknown) {
+          setTrade((current) => ({
+            ...current,
+            message: `Trade confirmed, but duel setup failed: ${cause instanceof Error ? cause.message : 'challenge service unavailable.'}`,
+          }))
+        }
+      }
+    } catch (cause: unknown) {
+      setTrade({
+        status: 'error',
+        message: describeTradeError(cause),
+        result: null,
+      })
+    }
+  }
+
+  async function checkSettlement() {
+    if (!wallet.address || !selectedMarket) return
+    setSettlement({ ...initialSettlementState, status: 'loading' })
+    try {
+      const snapshot = await loadSettlement({ marketId: selectedMarket.marketId, address: wallet.address })
+      setSettlement({ status: 'ready', message: null, snapshot, redemptionHash: null })
+    } catch (cause: unknown) {
+      setSettlement({ ...initialSettlementState, status: 'error', message: cause instanceof Error ? cause.message : 'Settlement could not be read.' })
+    }
+  }
+
+  async function redeem(outcomeIdx: OutcomeIndex) {
+    if (!wallet.client || !wallet.address || !selectedMarket) return
+    setSettlement((current) => ({ ...current, status: 'redeeming', message: null }))
+    try {
+      const result = await redeemSettlement({
+        marketId: selectedMarket.marketId,
+        address: wallet.address,
+        walletClient: wallet.client,
+        outcomeIdx,
+      })
+      const snapshot = await loadSettlement({ marketId: selectedMarket.marketId, address: wallet.address })
+      setSettlement({
+        status: 'ready',
+        message: `Redeemed ${result.amount.toString()} ${result.outcomeIdx === 0 ? 'UP' : 'DOWN'} outcome units.`,
+        snapshot,
+        redemptionHash: result.hash,
+      })
+    } catch (cause: unknown) {
+      setSettlement((current) => ({ ...current, status: 'error', message: cause instanceof Error ? cause.message : 'Redemption was not completed.' }))
+    }
+  }
+
+  function reviewTrade(record: TradeRecord) {
+    setReviewRecord(record)
+    setReviewSettlement(initialSettlementState)
+  }
+
+  async function checkReviewSettlement() {
+    if (!wallet.address || !reviewRecord) return
+    setReviewSettlement({ ...initialSettlementState, status: 'loading' })
+    try {
+      const snapshot = await loadSettlement({ marketId: reviewRecord.marketId, address: wallet.address })
+      const hydratedRecord = enrichTradeRecord(reviewRecord, snapshot)
+      saveTradeRecord(hydratedRecord)
+      setReviewRecord(hydratedRecord)
+      setHistory((current) => current.map((record) => tradeHistoryKey(record) === tradeHistoryKey(reviewRecord) ? hydratedRecord : record))
+      setHistorySettlements((current) => new Map(current).set(snapshot.market.marketId.toLowerCase(), snapshot))
+      setReviewSettlement({ status: 'ready', message: null, snapshot, redemptionHash: null })
+    } catch (cause: unknown) {
+      setReviewSettlement({ ...initialSettlementState, status: 'error', message: cause instanceof Error ? cause.message : 'Settlement could not be read.' })
+    }
+  }
+
+  async function redeemReviewed(outcomeIdx: OutcomeIndex) {
+    if (!wallet.client || !wallet.address || !reviewRecord) return
+    setReviewSettlement((current) => ({ ...current, status: 'redeeming', message: null }))
+    try {
+      const result = await redeemSettlement({
+        marketId: reviewRecord.marketId,
+        address: wallet.address,
+        walletClient: wallet.client,
+        outcomeIdx,
+      })
+      const snapshot = await loadSettlement({ marketId: reviewRecord.marketId, address: wallet.address })
+      const hydratedRecord = enrichTradeRecord(reviewRecord, snapshot)
+      saveTradeRecord(hydratedRecord)
+      setReviewRecord(hydratedRecord)
+      setHistory((current) => current.map((record) => tradeHistoryKey(record) === tradeHistoryKey(reviewRecord) ? hydratedRecord : record))
+      setHistorySettlements((current) => new Map(current).set(snapshot.market.marketId.toLowerCase(), snapshot))
+      setReviewSettlement({
+        status: 'ready',
+        message: `Redeemed ${result.amount.toString()} ${result.outcomeIdx === 0 ? 'UP' : 'DOWN'} outcome units.`,
+        snapshot,
+        redemptionHash: result.hash,
+      })
+    } catch (cause: unknown) {
+      setReviewSettlement((current) => ({ ...current, status: 'error', message: cause instanceof Error ? cause.message : 'Redemption was not completed.' }))
+    }
+  }
+
+  useEffect(() => {
+    let active = true
+    listLiveMarkets()
+      .then((result) => {
+        if (active) {
+          setMarkets(result.markets)
+          setDiagnostics({ scanned: result.scanned, checked: result.checked, bookCoverage: result.bookCoverage })
+        }
+      })
+      .catch((cause: unknown) => {
+        if (active) setError(cause instanceof Error ? cause.message : 'Could not load live markets.')
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  return (
+    <section className={`lobby lobby-view-${view}`} aria-labelledby="lobby-title">
+      <WalletDock wallet={wallet} onConnect={connectWallet} onSwitchChain={switchWalletChain} onDisconnect={disconnectWallet} />
+      {view === 'overview' && <>
+        <OverviewSnapshot markets={markets} followUps={followUps} challenges={challenges} wallet={wallet} onViewChange={onViewChange} />
+        <BeginnerLesson />
+      </>}
+      {view === 'markets' && <>
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">01 / Live market board</p>
+            <h2 id="lobby-title">Pick a window<br /><em>worth proving.</em></h2>
+          </div>
+          <p className="section-note">Read-only testnet discovery. Every card is keyed to the live `marketId` so a recycled pool never overwrites your record.</p>
+        </div>
+        {loading && <div className="lobby-state">Querying DreamDEX live markets<span className="loading-dots">...</span></div>}
+        {error && <div className="lobby-state lobby-error">Live market query failed: {error}</div>}
+        {challengeError && <div className="lobby-state lobby-error">Challenge: {challengeError}</div>}
+        {incomingChallenge && !selectedMarket && <ChallengeInvite challenge={incomingChallenge} available={markets.some((market) => market.marketId.toLowerCase() === incomingChallenge.marketId.toLowerCase())} onJoin={openIncomingChallenge} />}
+        {!loading && !error && (
+          <div className="market-grid">
+            {markets.map((market) => (
+              <MarketCard key={market.marketId} market={market} onSelect={() => {
+                setTrade(initialTradeState)
+                setSettlement(initialSettlementState)
+                setActiveChallenge(incomingChallenge?.marketId.toLowerCase() === market.marketId.toLowerCase() ? incomingChallenge : null)
+                setSelectedMarket(market)
+              }} />
+            ))}
+          </div>
+        )}
+        {!loading && !error && markets.length === 0 && <div className="lobby-state">No live binary markets are available right now.</div>}
+        {import.meta.env.DEV && diagnostics && (
+          <aside className="diagnostics" aria-label="Development diagnostics">
+            <span>DEV DIAGNOSTICS</span>
+            <span>scanned {diagnostics.scanned}</span>
+            <span>checked {diagnostics.checked}</span>
+            <span>eligible {markets.length}</span>
+            <span>book coverage {diagnostics.bookCoverage}/{markets.length}</span>
+          </aside>
+        )}
+      </>}
+      {view === 'coach' && <>
+        {challengeError && <div className="lobby-state lobby-error">Challenge: {challengeError}</div>}
+        {incomingChallenge && !selectedMarket && <ChallengeInvite challenge={incomingChallenge} available={markets.some((market) => market.marketId.toLowerCase() === incomingChallenge.marketId.toLowerCase())} onJoin={openIncomingChallenge} />}
+        <CoachInboxPreview followUps={followUps} history={history} onReview={reviewTrade} />
+        <DuelBoard challenges={challenges} onOpen={openChallenge} />
+      </>}
+      {view === 'history' && <>
+        <VerifiedReplay />
+        {wallet.address ? <TradeHistoryPanel history={history} settlements={historySettlements} onReview={reviewTrade} /> : <div className="history-empty-state"><p className="eyebrow">Wallet history</p><h2>Connect a wallet to see your receipts.</h2><p>Your decision records are wallet-scoped. Open Live markets when you are ready to connect and trade.</p><button className="primary-button" type="button" onClick={() => onViewChange('markets')}>Open live markets <span>-&gt;</span></button></div>}
+      </>}
+      {selectedMarket && (
+        <DecisionComposer
+          key={selectedMarket.marketId}
+          market={selectedMarket}
+          wallet={wallet}
+          trade={trade}
+          settlement={settlement}
+          challenge={activeChallenge}
+          defaultMode={activeChallenge?.status === 'waiting' ? 'friend' : 'solo'}
+          onConnect={connectWallet}
+          onSwitchChain={switchWalletChain}
+          onExecute={executeTrade}
+          onCheckSettlement={checkSettlement}
+          onRedeem={redeem}
+          onClose={() => {
+            setTrade(initialTradeState)
+            setSettlement(initialSettlementState)
+            setActiveChallenge(null)
+            setSelectedMarket(null)
+          }}
+        />
+      )}
+      {reviewRecord && (
+        <TradeReview
+          record={reviewRecord}
+          settlement={reviewSettlement}
+          onCheckSettlement={checkReviewSettlement}
+          onRedeem={redeemReviewed}
+          onClose={() => {
+            setReviewSettlement(initialSettlementState)
+            setReviewRecord(null)
+          }}
+        />
+      )}
+    </section>
+  )
+}

@@ -1,0 +1,26 @@
+{
+  "name": "signalsprint",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@somnia-chain/markets-sdk": "0.28.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "viem": "2.56.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.1",
+    "typescript": "6.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  }
+}
