@@ -194,7 +194,70 @@ export function saveTradeRecord(record: TradeRecord): TradeRecord[] {
   } catch { return [record] }
 }
 
-export function isCoachFollowUpReady(scheduledAt: number, now: number) { return now >= scheduledAt }
+export function isCoachFollowUpReady(scheduledAt: number, now: number) {
+  return now >= scheduledAt
+}
+
+export type CoachReview = {
+  id: string
+  marketId: string
+  asset: string
+  interval: string | null
+  question: string
+  side: 'UP' | 'DOWN'
+  reason: string
+  confidence: number | null
+  scheduledAt: number | null
+  status: 'queued' | 'ready' | 'reviewed'
+  record: TradeRecord | null
+}
+
+export function deriveCoachReviews(
+  history: TradeRecord[],
+  followUps: CoachFollowUp[],
+  settlements: Map<string, SettlementSnapshot>,
+  now: number,
+): CoachReview[] {
+  const followUpById = new Map(followUps.map((followUp) => [followUp.id.toLowerCase(), followUp]))
+  const reviews = history.map((record): CoachReview => {
+    const followUp = followUpById.get(record.id.toLowerCase()) ?? followUpById.get(record.hash.toLowerCase())
+    const snapshot = settlements.get(record.marketId.toLowerCase())
+    const expiry = snapshot ? Number(snapshot.market.expiry) * 1000 : followUp?.scheduledAt ?? null
+    const status = record.decisionResult && record.decisionResult !== 'PENDING'
+      ? 'reviewed'
+      : snapshot?.stage === 'Trading' || (expiry !== null && expiry > now)
+        ? 'queued'
+        : 'ready'
+
+    return {
+      id: record.id,
+      marketId: record.marketId,
+      asset: record.asset,
+      interval: record.interval,
+      question: record.question,
+      side: record.outcome,
+      reason: record.thesis ?? followUp?.reason ?? 'No thesis recorded',
+      confidence: record.confidence ?? followUp?.confidence ?? null,
+      scheduledAt: expiry,
+      status,
+      record,
+    }
+  })
+
+  const known = new Set(reviews.map((review) => review.id.toLowerCase()))
+  for (const followUp of followUps) {
+    if (known.has(followUp.id.toLowerCase())) continue
+    reviews.push({
+      ...followUp,
+      status: isCoachFollowUpReady(followUp.scheduledAt, now) ? 'ready' : 'queued',
+      record: null,
+    })
+  }
+
+  const rank = { ready: 0, queued: 1, reviewed: 2 }
+  return reviews.sort((left, right) => rank[left.status] - rank[right.status] || (right.scheduledAt ?? 0) - (left.scheduledAt ?? 0))
+}
+
 export function shortAddress(address: Address) { return `${address.slice(0, 6)}…${address.slice(-4)}` }
 export function formatTradeDate(timestamp: number) { return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(timestamp) }
 export function formatFollowUpTime(timestamp: number) { return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(timestamp) }

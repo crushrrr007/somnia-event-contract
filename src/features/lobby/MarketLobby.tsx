@@ -31,6 +31,7 @@ import {
   clearWalletSession,
   confidenceBands,
   describeTradeError,
+  deriveCoachReviews,
   duelModes,
   enrichTradeRecord,
   formatFollowUpTime,
@@ -268,9 +269,24 @@ function BeginnerLesson() {
   )
 }
 
-function CoachInboxPreview({ followUps, history, onReview }: { followUps: CoachFollowUp[]; history: TradeRecord[]; onReview: (record: TradeRecord) => void }) {
+function CoachInboxPreview({
+  wallet,
+  followUps,
+  history,
+  settlements,
+  onReview,
+  onOpenMarkets,
+}: {
+  wallet: WalletState
+  followUps: CoachFollowUp[]
+  history: TradeRecord[]
+  settlements: Map<string, SettlementSnapshot>
+  onReview: (record: TradeRecord) => void
+  onOpenMarkets: () => void
+}) {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
+  const reviews = deriveCoachReviews(history, followUps, settlements, now)
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30000)
@@ -280,54 +296,51 @@ function CoachInboxPreview({ followUps, history, onReview }: { followUps: CoachF
   return (
     <section className="coach-inbox-preview" aria-labelledby="coach-inbox-title">
       <div>
-        <p className="eyebrow">Scheduled follow-up{followUps.length === 0 ? ' · sample' : ''}</p>
+        <p className="eyebrow">Decision Coach · receipt-based feedback</p>
         <h3 id="coach-inbox-title">The market closes.<br /><em>The lesson stays.</em></h3>
-        <p className="coach-inbox-lede">A Coach Inbox turns settlement into one useful next step, even when you have already closed the app. Each confirmed fill schedules a review at expiry.</p>
+        <p className="coach-inbox-lede">Decision Coach compares your wallet-authored direction, confidence, and entry price with settlement. It is deterministic feedback from your own receipts—not AI advice or a trade recommendation.</p>
       </div>
-      {followUps.length === 0 ? (
-        <article className="coach-message-card">
-          <div className="coach-message-topline">
-            <span className="coach-unread"><span className="status-dot" /> Demo lesson</span>
-            <span>ETH · 15m</span>
-          </div>
-          <strong>Correct direction. Expensive entry.</strong>
-          <p>You called UP and the market settled UP, but your 82c entry left less room for error.</p>
-          <button type="button" className="coach-message-action" onClick={() => setExpanded((current) => current === 'sample' ? null : 'sample')}>
-            {expanded === 'sample' ? 'Hide the lesson' : 'Open the lesson'} <span>{expanded === 'sample' ? '^' : '->'}</span>
-          </button>
-          {expanded === 'sample' && (
-            <div className="coach-message-detail">
-              <span>Next concept</span>
-              <strong>Probability is price, not certainty.</strong>
-              <small>Place a confirmed testnet trade to schedule a real review card at market expiry.</small>
-            </div>
-          )}
+      {!wallet.address ? (
+        <article className="coach-message-card coach-empty-card">
+          <div className="coach-message-topline"><span>Wallet-scoped reviews</span><span>Disconnected</span></div>
+          <strong>Connect from the navigation bar.</strong>
+          <p>Your review queue is reconstructed from indexed fills and on-chain decision receipts after you connect.</p>
+        </article>
+      ) : reviews.length === 0 ? (
+        <article className="coach-message-card coach-empty-card">
+          <div className="coach-message-topline"><span>Decision Coach</span><span>No receipts yet</span></div>
+          <strong>Make one call worth reviewing.</strong>
+          <p>Choose a live market, record your confidence and reason, then return here after the market closes.</p>
+          <button type="button" className="coach-message-action" onClick={onOpenMarkets}>Open live markets <span>-&gt;</span></button>
         </article>
       ) : (
         <div className="coach-message-list">
-          {followUps.slice(0, 3).map((followUp) => {
-            const ready = isCoachFollowUpReady(followUp.scheduledAt, now)
-            const isExpanded = expanded === followUp.id
-            const matchingRecord = history.find((record) => record.id === followUp.id)
+          {reviews.slice(0, 6).map((review) => {
+            const isExpanded = expanded === review.id
+            const resultLabel = review.record?.decisionResult === 'WIN' ? 'Direction correct' : review.record?.decisionResult === 'LOSS' ? 'Direction missed' : review.record?.decisionResult === 'VOID' ? 'Market voided' : 'Review complete'
             return (
-              <article className="coach-message-card" key={followUp.id}>
+              <article className={`coach-message-card coach-status-${review.status}`} key={review.id}>
                 <div className="coach-message-topline">
-                  <span className="coach-unread"><span className="status-dot" /> {ready ? 'Review ready' : 'Review queued'}</span>
-                  <span>{followUp.asset} · {followUp.interval ?? 'live'}</span>
+                  <span className="coach-unread"><span className="status-dot" /> {review.status === 'reviewed' ? resultLabel : review.status === 'ready' ? 'Review ready' : 'Review queued'}</span>
+                  <span>{review.asset} · {review.interval ?? 'live'}</span>
                 </div>
-                <strong>{ready ? 'Come back and score the call.' : 'Your review is queued.'}</strong>
-                <p>{ready ? 'The market window has closed. Compare your direction and confidence with the settled result before checking the payout.' : `Your ${followUp.side} call will become a review lesson at ${formatFollowUpTime(followUp.scheduledAt)}.`}</p>
-                <button type="button" className="coach-message-action" onClick={() => setExpanded(isExpanded ? null : followUp.id)}>
-                  {isExpanded ? 'Hide the record' : 'Open the record'} <span>{isExpanded ? '^' : '->'}</span>
+                <strong>{review.status === 'reviewed' ? resultLabel : review.status === 'ready' ? 'Settlement is ready to inspect.' : 'Your decision is waiting for expiry.'}</strong>
+                <p>{review.status === 'queued' && review.scheduledAt
+                  ? `Your ${review.side} call becomes reviewable at ${formatFollowUpTime(review.scheduledAt)}.`
+                  : review.status === 'reviewed'
+                    ? review.record?.decisionScore == null ? 'The receipt is settled. Review the outcome and entry before your next call.' : `Calibration score: ${(review.record.decisionScore * 100).toFixed(0)}%. Use the result to calibrate your next confidence level.`
+                    : 'Check the settled direction, calibration score, and any claimable position.'}</p>
+                <button type="button" className="coach-message-action" onClick={() => setExpanded(isExpanded ? null : review.id)}>
+                  {isExpanded ? 'Hide decision' : 'View decision'} <span>{isExpanded ? '^' : '-&gt;'}</span>
                 </button>
                 {isExpanded && (
                   <div className="coach-message-detail">
-                    <span>Decision record</span>
-                    <strong>{followUp.side} · {followUp.confidence}% confidence · {followUp.reason}</strong>
-                    <small>{followUp.question} · marketId …{followUp.marketId.slice(-8)}</small>
-                    {ready && matchingRecord && (
-                      <button type="button" className="coach-message-action" onClick={() => onReview(matchingRecord)}>
-                        Review settlement <span>-&gt;</span>
+                    <span>Wallet-authored decision</span>
+                    <strong>{review.side} · {review.confidence == null ? 'confidence unavailable' : `${review.confidence}% confidence`} · {review.reason}</strong>
+                    <small>{review.question} · marketId …{review.marketId.slice(-8)}</small>
+                    {review.record && review.status !== 'queued' && (
+                      <button type="button" className="coach-message-action" onClick={() => onReview(review.record!)}>
+                        {review.status === 'reviewed' ? 'Open full review' : 'Review settlement'} <span>-&gt;</span>
                       </button>
                     )}
                   </div>
@@ -1347,7 +1360,14 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
       {view === 'coach' && <>
         {challengeError && <div className="lobby-state lobby-error">Challenge: {challengeError}</div>}
         {incomingChallenge && !selectedMarket && <ChallengeInvite challenge={incomingChallenge} available={markets.some((market) => market.marketId.toLowerCase() === incomingChallenge.marketId.toLowerCase())} onJoin={openIncomingChallenge} />}
-        <CoachInboxPreview followUps={followUps} history={history} onReview={reviewTrade} />
+        <CoachInboxPreview
+          wallet={wallet}
+          followUps={followUps}
+          history={history}
+          settlements={historySettlements}
+          onReview={reviewTrade}
+          onOpenMarkets={() => onViewChange('markets')}
+        />
         <DuelBoard challenges={challenges} onOpen={openChallenge} />
       </>}
       {view === 'history' && <>
