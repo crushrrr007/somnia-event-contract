@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { createWalletClient, custom, type Address, type EIP1193Provider, type Hex, type WalletClient } from 'viem'
 import { somniaShannon } from '@somnia-chain/markets-sdk/chains'
 import {
@@ -352,35 +353,35 @@ function WalletDock({
   onDisconnect: () => void
 }) {
   const connectedAddress = wallet.status === 'connected' ? wallet.address : null
-  return (
-    <section className="wallet-dock" aria-label="Wallet connection">
-      <div className="wallet-dock-copy">
-        <span className="eyebrow">Wallet session</span>
-        {connectedAddress ? (
-          <strong>{shortAddress(connectedAddress)}</strong>
-        ) : (
-          <strong>{wallet.status === 'connecting' ? 'Reconnecting…' : 'Not connected'}</strong>
-        )}
-        <small className={wallet.status === 'error' ? 'wallet-dock-error' : undefined}>
-          {wallet.status === 'error' && wallet.message
-            ? wallet.message
-            : connectedAddress
-              ? 'Somnia testnet · self-custody'
-              : 'Connect once to keep your workspace ready'}
-        </small>
-      </div>
-      <div className="wallet-dock-actions">
-        {wallet.status === 'wrong-network' ? (
-          <button className="wallet-dock-button" type="button" onClick={onSwitchChain}>Switch network</button>
-        ) : connectedAddress ? (
-          <button className="wallet-dock-button wallet-dock-button-muted" type="button" onClick={onDisconnect}>Disconnect</button>
-        ) : (
-          <button className="wallet-dock-button" type="button" onClick={onConnect} disabled={wallet.status === 'connecting'}>
-            {wallet.status === 'connecting' ? 'Reconnecting…' : 'Connect wallet'}
-          </button>
-        )}
-      </div>
-    </section>
+  const [mount, setMount] = useState<HTMLElement | null>(null)
+
+  useEffect(() => {
+    setMount(document.getElementById('navbar-wallet'))
+  }, [])
+
+  if (!mount) return null
+
+  return createPortal(
+    <div className="navbar-wallet" aria-label="Wallet connection">
+      {wallet.status === 'wrong-network' ? (
+        <button className="navbar-wallet-button navbar-wallet-warning" type="button" onClick={onSwitchChain}>Switch network</button>
+      ) : connectedAddress ? (
+        <button
+          className="navbar-wallet-button navbar-wallet-connected"
+          type="button"
+          onClick={onDisconnect}
+          title="Disconnect wallet"
+        >
+          <span className="status-dot" /> {shortAddress(connectedAddress)}
+        </button>
+      ) : (
+        <button className="navbar-wallet-button" type="button" onClick={onConnect} disabled={wallet.status === 'connecting'}>
+          {wallet.status === 'connecting' ? 'Connecting…' : 'Connect wallet'}
+        </button>
+      )}
+      {wallet.status === 'error' && wallet.message && <span className="sr-only" role="status">{wallet.message}</span>}
+    </div>,
+    mount,
   )
 }
 
@@ -483,8 +484,6 @@ function DecisionComposer({
   settlement,
   challenge,
   defaultMode = 'solo',
-  onConnect,
-  onSwitchChain,
   onExecute,
   onCheckSettlement,
   onRedeem,
@@ -496,8 +495,6 @@ function DecisionComposer({
   settlement: SettlementState
   challenge: ChallengeRecord | null
   defaultMode?: DuelMode
-  onConnect: () => void
-  onSwitchChain: () => void
   onExecute: (outcome: 'UP' | 'DOWN', amount: number, confidence: number, thesis: string, mode: DuelMode) => void
   onCheckSettlement: () => void
   onRedeem: (outcomeIdx: OutcomeIndex) => void
@@ -638,13 +635,13 @@ function DecisionComposer({
                   : `Place ${amount} ${outcome === 'UP' ? 'YES' : 'NO'} contracts`}
             </button>
           </>
-        ) : wallet.status === 'wrong-network' ? (
-          <button className="composer-submit" type="button" onClick={onSwitchChain}>Switch to Somnia testnet</button>
-        ) : (
-          <button className="composer-submit" type="button" onClick={onConnect} disabled={wallet.status === 'connecting'}>
-            {wallet.status === 'connecting' ? 'Connecting wallet…' : 'Connect wallet to continue'}
-          </button>
-        )}
+      ) : (
+        <p className="composer-wallet-prompt" role="status">
+          {wallet.status === 'wrong-network'
+            ? 'Switch to Somnia testnet from the wallet control in the navigation bar.'
+            : 'Connect your wallet from the navigation bar to place this trade.'}
+        </p>
+      )}
         {wallet.message && <p className={`wallet-message ${wallet.status === 'error' ? 'wallet-error' : ''}`}>{wallet.message}</p>}
         {trade.message && <p className={`wallet-message ${trade.status === 'error' ? 'wallet-error' : ''}`}>{trade.message}</p>}
         {trade.result && (
@@ -1365,10 +1362,8 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
           trade={trade}
           settlement={settlement}
           challenge={activeChallenge}
-          defaultMode={activeChallenge?.status === 'waiting' ? 'friend' : 'solo'}
-          onConnect={connectWallet}
-          onSwitchChain={switchWalletChain}
-          onExecute={executeTrade}
+        defaultMode={activeChallenge?.status === 'waiting' ? 'friend' : 'solo'}
+        onExecute={executeTrade}
           onCheckSettlement={checkSettlement}
           onRedeem={redeem}
           onClose={() => {

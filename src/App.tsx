@@ -72,8 +72,8 @@ function App() {
           ))}
         </nav>
         <div className="topbar-actions">
-          <span className="self-custody-pill">Self-custody</span>
           <span className="network-pill"><span className="status-dot" /> Somnia testnet</span>
+          <div id="navbar-wallet" />
         </div>
       </header>
 
