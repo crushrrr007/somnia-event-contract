@@ -19,10 +19,11 @@ export const decisionRegistryAbi = parseAbi([
   'event ChallengeCreated(uint256 indexed challengeId, address indexed creator, bytes32 indexed marketId, uint64 expiry)',
 ])
 
+const DEFAULT_REGISTRY_ADDRESS = '0x4ac0e9353432fdce17948e0b2a2162de1a4d3593' as Address
 const configuredAddress = import.meta.env.VITE_REGISTRY_ADDRESS
 export const DECISION_REGISTRY_ADDRESS = configuredAddress && /^0x[0-9a-fA-F]{40}$/.test(configuredAddress)
   ? configuredAddress as Address
-  : null
+  : DEFAULT_REGISTRY_ADDRESS
 
 const publicClient = createPublicClient({ chain: somniaShannon, transport: http() })
 const AMOUNT_SCALE = 1_000_000n

@@ -14,21 +14,58 @@ import {
   listWalletTradeHistory,
   loadSettlement,
   redeemSettlement,
-  type IocTradeResult,
   type LiveMarketWithBook,
   type SettlementSnapshot,
-  type WalletTradeRecord,
 } from '../../lib/dreamdex/gateway'
 import {
   DECISION_REGISTRY_ADDRESS,
   createChallenge as createOnchainChallenge,
-  fetchChallenge,
   fetchDecisions,
   fetchWalletChallenges,
   joinChallenge as joinOnchainChallenge,
   recordDecision,
-  type OnchainChallenge,
 } from '../../lib/dreamdex/registry'
+import {
+  VERIFIED_REPLAY,
+  clearWalletSession,
+  confidenceBands,
+  describeTradeError,
+  duelModes,
+  enrichTradeRecord,
+  formatFollowUpTime,
+  formatTradeDate,
+  initialSettlementState,
+  initialTradeState,
+  isCoachFollowUpReady,
+  loadChallenge,
+  mergeChallenges,
+  mergeTradeHistory,
+  readChallengeCache,
+  readCoachFollowUps,
+  readTradeHistory,
+  readWalletSession,
+  reasonCards,
+  saveChallengeCache,
+  saveCoachFollowUp,
+  saveTradeRecord,
+  saveWalletSession,
+  shortAddress,
+  toChallengeRecord,
+  tradeHistoryKey,
+  type ChallengePayload,
+  type ChallengeRecord,
+  type CoachFollowUp,
+  type DuelMode,
+  type LobbyView,
+  type PracticeSide,
+  type ReasonId,
+  type SettlementState,
+  type TradeRecord,
+  type TradeState,
+  type WalletState,
+} from './lobby-model'
+
+export type { LobbyView } from './lobby-model'
 
 type ProviderListener = (...args: unknown[]) => void
 type InjectedProvider = EIP1193Provider & {
@@ -74,120 +111,6 @@ function MarketCard({ market, onSelect }: { market: LiveMarketWithBook; onSelect
       <p className="market-id">marketId · …{market.marketId.slice(-8)}</p>
     </article>
   )
-}
-
-type PracticeSide = 'UP' | 'DOWN'
-type ReasonId = 'ABOVE_OPEN' | 'MOMENTUM' | 'REVERSAL' | 'MARKET_ODDS' | 'INSTINCT'
-
-const reasonCards = [
-  { id: 'ABOVE_OPEN', label: 'Above the open', copy: 'Price is holding above the opening line.' },
-  { id: 'MOMENTUM', label: 'Momentum', copy: 'The move looks strong enough to continue.' },
-  { id: 'REVERSAL', label: 'Reversal', copy: 'The move looks stretched and may turn.' },
-  { id: 'MARKET_ODDS', label: 'Market odds', copy: 'The contract price looks mispriced.' },
-  { id: 'INSTINCT', label: 'Instinct', copy: 'I am practicing a hunch.' },
-] as const
-
-const confidenceBands = [
-  { label: 'Exploring', value: 55, copy: 'Learning the pattern' },
-  { label: 'Leaning', value: 75, copy: 'I have a reason' },
-  { label: 'Strong view', value: 90, copy: 'I would defend it' },
-] as const
-
-type DuelMode = 'solo' | 'friend' | 'benchmark'
-type ChallengeStatus = 'waiting' | 'joined'
-export type LobbyView = 'overview' | 'markets' | 'coach' | 'history'
-
-type ChallengePayload = {
-  marketId: string
-  asset: string
-  interval: string | null
-  question: string
-  expiry: string
-  side: 'UP' | 'DOWN'
-  reason: string
-  confidence: number
-  amount: number
-  wallet: string
-}
-
-type ChallengeRecord = {
-  id: string
-  createdAt: number
-  status: ChallengeStatus
-  marketId: string
-  asset: string
-  interval: string | null
-  question: string
-  expiry: string
-  creator: ChallengePayload
-  opponent: ChallengePayload | null
-}
-
-const duelModes = [
-  { id: 'solo', label: 'Solo lesson', copy: 'Trade, settle, learn' },
-  { id: 'friend', label: 'Reason Duel', copy: 'Same market, no pot' },
-  { id: 'benchmark', label: 'Shadow Coach', copy: 'Compare, do not copy' },
-] as const
-
-function toChallengeRecord(challenge: OnchainChallenge, market?: LiveMarketWithBook): ChallengeRecord {
-  const payload = (call: OnchainChallenge['creator']): ChallengePayload => ({
-    marketId: challenge.marketId,
-    asset: market?.asset ?? 'Market',
-    interval: market?.interval ?? null,
-    question: market?.question ?? 'On-chain Reason Duel',
-    expiry: challenge.expiry.toString(),
-    side: call.side,
-    reason: call.reason,
-    confidence: call.confidence,
-    amount: call.amount,
-    wallet: call.wallet,
-  })
-  return {
-    id: challenge.id,
-    createdAt: challenge.createdAt,
-    status: challenge.status,
-    marketId: challenge.marketId,
-    asset: market?.asset ?? 'Market',
-    interval: market?.interval ?? null,
-    question: market?.question ?? 'On-chain Reason Duel',
-    expiry: challenge.expiry.toString(),
-    creator: payload(challenge.creator),
-    opponent: challenge.opponent ? payload(challenge.opponent) : null,
-  }
-}
-
-async function loadChallenge(id: string, markets: LiveMarketWithBook[] = []) {
-  const challenge = await fetchChallenge(id)
-  return toChallengeRecord(challenge, markets.find((market) => market.marketId.toLowerCase() === challenge.marketId.toLowerCase()))
-}
-
-const CHALLENGE_CACHE_KEY = 'signalsprint.challenge-cache.v1'
-
-function readChallengeCache(): ChallengeRecord[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(CHALLENGE_CACHE_KEY) ?? '[]') as ChallengeRecord[]
-    return stored.filter((challenge) => typeof challenge?.id === 'string' && typeof challenge?.marketId === 'string')
-  } catch {
-    return []
-  }
-}
-
-function mergeChallenges(...groups: ChallengeRecord[][]): ChallengeRecord[] {
-  const unique = new Map<string, ChallengeRecord>()
-  for (const group of groups) {
-    for (const challenge of group) unique.set(challenge.id, challenge)
-  }
-  return [...unique.values()].sort((left, right) => right.createdAt - left.createdAt)
-}
-
-function saveChallengeCache(challenges: ChallengeRecord[]) {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.setItem(CHALLENGE_CACHE_KEY, JSON.stringify(mergeChallenges(challenges).slice(0, 20)))
-  } catch {
-    // The API remains the source of truth if browser storage is unavailable.
-  }
 }
 
 function ChallengeInvite({
@@ -264,7 +187,7 @@ function DuelBoard({ challenges, onOpen }: { challenges: ChallengeRecord[]; onOp
           ))}
         </div>
       )}
-      <small className="trade-history-note">Browser cache keeps these rounds after a refresh or local server restart. Production still needs authenticated server persistence.</small>
+      <small className="trade-history-note">Rounds are wallet-authored on Somnia. Browser cache only speeds up repeat visits; the chain remains the source of truth.</small>
     </section>
   )
 }
@@ -344,52 +267,6 @@ function BeginnerLesson() {
   )
 }
 
-type CoachFollowUp = {
-  id: string
-  marketId: string
-  asset: string
-  interval: string | null
-  question: string
-  side: 'UP' | 'DOWN'
-  reason: string
-  confidence: number
-  scheduledAt: number
-}
-
-const COACH_FOLLOW_UP_KEY = 'signalsprint.coach-follow-ups.v1'
-
-function readCoachFollowUps(): CoachFollowUp[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(COACH_FOLLOW_UP_KEY) ?? '[]') as CoachFollowUp[]
-    return stored.filter((followUp) => typeof followUp?.id === 'string' && typeof followUp?.scheduledAt === 'number')
-  } catch {
-    return []
-  }
-}
-
-function saveCoachFollowUp(followUp: CoachFollowUp): CoachFollowUp[] {
-  const next = [followUp, ...readCoachFollowUps().filter((item) => item.id !== followUp.id)]
-    .sort((left, right) => right.scheduledAt - left.scheduledAt)
-    .slice(0, 20)
-  if (typeof window !== 'undefined') {
-    try {
-      window.localStorage.setItem(COACH_FOLLOW_UP_KEY, JSON.stringify(next))
-    } catch {
-      // The current session still shows the scheduled card if storage is unavailable.
-    }
-  }
-  return next
-}
-
-function formatFollowUpTime(timestamp: number) {
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(timestamp)
-}
-
-export function isCoachFollowUpReady(scheduledAt: number, now: number) {
-  return now >= scheduledAt
-}
-
 function CoachInboxPreview({ followUps, history, onReview }: { followUps: CoachFollowUp[]; history: TradeRecord[]; onReview: (record: TradeRecord) => void }) {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
@@ -463,89 +340,6 @@ function CoachInboxPreview({ followUps, history, onReview }: { followUps: CoachF
   )
 }
 
-type WalletState = {
-  client: WalletClient | null
-  address: Address | null
-  chainId: number | null
-  status: 'idle' | 'connecting' | 'connected' | 'wrong-network' | 'error'
-  message: string | null
-}
-
-type WalletSession = { address: Address; chainId: number }
-
-const WALLET_SESSION_KEY = 'signalsprint.wallet-session.v1'
-
-function readWalletSession(): WalletSession | null {
-  if (typeof window === 'undefined') return null
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(WALLET_SESSION_KEY) ?? 'null') as Partial<WalletSession> | null
-    if (typeof stored?.address !== 'string' || typeof stored.chainId !== 'number') return null
-    return { address: stored.address as Address, chainId: stored.chainId }
-  } catch {
-    return null
-  }
-}
-
-function saveWalletSession(address: Address, chainId: number) {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.setItem(WALLET_SESSION_KEY, JSON.stringify({ address, chainId }))
-  } catch {
-    // Wallet connection remains usable if browser storage is unavailable.
-  }
-}
-
-function clearWalletSession() {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.removeItem(WALLET_SESSION_KEY)
-  } catch {
-    // Nothing else is required when browser storage is unavailable.
-  }
-}
-
-type TradeState = {
-  status: 'idle' | 'preparing' | 'confirmed' | 'error'
-  message: string | null
-  result: IocTradeResult | null
-}
-
-const initialTradeState: TradeState = { status: 'idle', message: null, result: null }
-
-type SettlementState = {
-  status: 'idle' | 'loading' | 'ready' | 'redeeming' | 'error'
-  message: string | null
-  snapshot: SettlementSnapshot | null
-  redemptionHash: string | null
-}
-
-type TradeRecord = WalletTradeRecord
-
-const TRADE_HISTORY_KEY = 'signalsprint.trade-history.v1'
-
-const VERIFIED_REPLAY = {
-  marketId: '0x000000000000000000000000000000000000000000000000000000000000e3fb' as Hex,
-  asset: 'ETH',
-  interval: '15m',
-  question: 'ETH closes at or above its opening price',
-  outcome: 'UP / YES',
-  fillAmount: '5.00',
-  fillPrice: '64.2¢',
-  tradeHash: '0x64a656c2b4410d5d05456d33b80b78fc55e3002045e7e8a1d2d26e721b01f099',
-  redemptionHash: '0x5eb9f2f0b9779520de6f581d2aea9d63e3a4415d8f4383d1084473f23a53d30e',
-} as const
-
-const initialSettlementState: SettlementState = {
-  status: 'idle',
-  message: null,
-  snapshot: null,
-  redemptionHash: null,
-}
-
-function shortAddress(address: Address) {
-  return `${address.slice(0, 6)}…${address.slice(-4)}`
-}
-
 function WalletDock({
   wallet,
   onConnect,
@@ -590,69 +384,6 @@ function WalletDock({
   )
 }
 
-function readTradeHistory(address: Address): TradeRecord[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(TRADE_HISTORY_KEY) ?? '[]') as TradeRecord[]
-    return stored.filter((record) => typeof record.wallet === 'string' && record.wallet.toLowerCase() === address.toLowerCase())
-  } catch {
-    return []
-  }
-}
-
-function tradeHistoryKey(record: TradeRecord) {
-  return `${record.hash.toLowerCase()}:${record.marketId.toLowerCase()}:${record.outcome}`
-}
-
-function mergeTradeHistory(...groups: TradeRecord[][]): TradeRecord[] {
-  const unique = new Map<string, TradeRecord>()
-  for (const group of groups) {
-    for (const record of group) unique.set(tradeHistoryKey(record), record)
-  }
-  return [...unique.values()].sort((left, right) => right.createdAt - left.createdAt)
-}
-
-function enrichTradeRecord(record: TradeRecord, snapshot: SettlementSnapshot): TradeRecord {
-  const score = evaluateDecisionScore({
-    outcome: record.outcome,
-    confidence: record.confidence,
-    fillPrice: record.averageFillPrice,
-    filledAmount: record.filledAmount,
-    isResolved: snapshot.isResolved,
-    isVoided: snapshot.isVoided,
-    winningOutcome: snapshot.winningOutcome,
-  })
-  return {
-    ...record,
-    settlement: {
-      stage: snapshot.stage,
-      isResolved: snapshot.isResolved,
-      isVoided: snapshot.isVoided,
-      winningOutcome: snapshot.winningOutcome,
-      checkedAt: Date.now(),
-    },
-    decisionResult: score.result,
-    decisionScore: score.decisionScore,
-    marketRelativeDelta: score.marketRelativeDelta,
-  }
-}
-
-function saveTradeRecord(record: TradeRecord): TradeRecord[] {
-  if (typeof window === 'undefined') return [record]
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(TRADE_HISTORY_KEY) ?? '[]') as TradeRecord[]
-    const next = [record, ...stored.filter((item) => item.id !== record.id && item.hash !== record.hash)].slice(0, 30)
-    window.localStorage.setItem(TRADE_HISTORY_KEY, JSON.stringify(next))
-    return next.filter((item) => item.wallet.toLowerCase() === record.wallet.toLowerCase())
-  } catch {
-    return [record]
-  }
-}
-
-function formatTradeDate(timestamp: number) {
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(timestamp)
-}
-
 function VerifiedReplay() {
   return (
     <section className="trade-history replay-panel" aria-labelledby="replay-title">
@@ -682,14 +413,6 @@ function VerifiedReplay() {
       <small className="trade-history-note">Replay evidence is labeled separately from live activity and is not counted as a new trade.</small>
     </section>
   )
-}
-
-function describeTradeError(cause: unknown) {
-  const message = cause instanceof Error ? cause.message : 'Trade was not completed.'
-  if (message.includes('ImmediateOrCancelNoFill')) {
-    return 'The live book changed before the IOC could fill. No position was created; choose the market again and retry.'
-  }
-  return message
 }
 
 async function addSomniaTestnet(client: WalletClient) {
