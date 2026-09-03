@@ -22,7 +22,10 @@ import {
   type DecisionResult,
 } from './decision'
 
-const INDEXER_URL = import.meta.env.VITE_INDEXER_URL ?? 'https://dev.smk.somnia.host/v1/graphql'
+// Route browser reads through our same-origin proxy. Direct cross-origin reads
+// can be blocked inside preview/deployed browser contexts even when the
+// upstream indexer itself is healthy.
+const INDEXER_URL = import.meta.env.VITE_INDEXER_URL ?? '/api/dreamdex-indexer'
 
 export type LiveMarket = Pick<
   BinaryMarket,
