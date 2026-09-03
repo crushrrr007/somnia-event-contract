@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { AgentLab } from '../agents/AgentLab'
 import { createWalletClient, custom, type Address, type EIP1193Provider, type Hex, type WalletClient } from 'viem'
 import { somniaShannon } from '@somnia-chain/markets-sdk/chains'
 import {
@@ -1357,7 +1358,10 @@ export function MarketLobby({ view, onViewChange }: { view: LobbyView; onViewCha
           </aside>
         )}
       </>}
-      {view === 'coach' && <>
+      {view === 'agents' && (
+  <AgentLab wallet={wallet} markets={markets} history={history} onViewChange={() => onViewChange('markets')} />
+  )}
+  {view === 'coach' && <>
         {challengeError && <div className="lobby-state lobby-error">Challenge: {challengeError}</div>}
         {incomingChallenge && !selectedMarket && <ChallengeInvite challenge={incomingChallenge} available={markets.some((market) => market.marketId.toLowerCase() === incomingChallenge.marketId.toLowerCase())} onJoin={openIncomingChallenge} />}
         <CoachInboxPreview

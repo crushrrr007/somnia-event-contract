@@ -36,6 +36,11 @@ export type LiveMarket = Pick<
   | 'lastPrice'
   | 'tradeCount'
   | 'quoteDecimals'
+  // Vault-binding fields for the Reactive Agent Lab.
+  | 'marketAddress'
+  | 'poolAddress'
+  | 'collateral'
+  | 'baseDecimals'
 >
 
 export type LiveMarketWithBook = LiveMarket & { book: BookTop | null }

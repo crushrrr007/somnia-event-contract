@@ -6,7 +6,7 @@ import { fetchChallenge, type OnchainChallenge } from '../../lib/dreamdex/regist
 export type PracticeSide = 'UP' | 'DOWN'
 export type ReasonId = 'ABOVE_OPEN' | 'MOMENTUM' | 'REVERSAL' | 'MARKET_ODDS' | 'INSTINCT'
 export type DuelMode = 'solo' | 'friend' | 'benchmark'
-export type LobbyView = 'overview' | 'markets' | 'coach' | 'history'
+export type LobbyView = 'overview' | 'markets' | 'coach' | 'history' | 'agents'
 
 export const reasonCards = [
   { id: 'ABOVE_OPEN', label: 'Above the open', copy: 'Price is holding above the opening line.' },

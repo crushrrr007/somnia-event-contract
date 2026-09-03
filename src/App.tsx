@@ -5,6 +5,7 @@ const sprintSteps = ['Discover', 'Decide', 'Execute', 'Settle', 'Review']
 const workspaceViews: Array<{ id: LobbyView; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'markets', label: 'Live markets' },
+  { id: 'agents', label: 'Agent Lab' },
   { id: 'coach', label: 'Coach' },
   { id: 'history', label: 'History' },
 ]
@@ -15,6 +16,12 @@ const workspaceCopy: Record<Exclude<LobbyView, 'overview'>, { eyebrow: string; t
     title: 'Trade a live window.',
     emphasis: 'With a bounded edge.',
     copy: 'Read the book, make one reasoned call, and see the exact risk before your wallet signs.',
+  },
+  agents: {
+    eyebrow: 'Workspace / Agent Lab',
+    title: 'Arm a policy.',
+    emphasis: 'Let the chain act.',
+    copy: 'A reactive vault watches real pool fills, asks Somnia\u2019s deterministic on-chain LLM for a fair probability, and trades only inside the edge you set. Every prediction becomes a receipt.',
   },
   coach: {
     eyebrow: 'Workspace / Coach',

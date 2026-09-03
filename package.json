@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "preview": "vite preview",
-    "deploy:registry": "tsx scripts/deploy-registry.ts"
+    "deploy:registry": "tsx scripts/deploy-registry.ts",
+    "deploy:agent-factory": "tsx scripts/deploy-agent-factory.ts"
   },
   "dependencies": {
     "@somnia-chain/markets-sdk": "0.28.1",
@@ -17,10 +18,11 @@
     "viem": "2.56.0"
   },
   "devDependencies": {
+    "@somnia-chain/reactivity-contracts": "^0.2.1",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
     "@vitejs/plugin-react": "6.1.1",
-    "solc": "^0.8.36",
+    "solc": "^0.8.30",
     "tsx": "^4.23.13",
     "typescript": "6.0.2",
     "vite": "8.2.2",
