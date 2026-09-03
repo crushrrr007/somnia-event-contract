@@ -508,6 +508,24 @@ function selectCandidates(markets: BinaryMarket[]): BinaryMarket[] {
   return (preferredWindows.length > 0 ? preferredWindows : supportedAssets).slice(0, 8)
 }
 
+/// Retry transient indexer failures ("Failed to fetch", 5xx) with backoff.
+/// Network blips should degrade to a slower load, not a hard lobby error.
+async function withIndexerRetry<T>(operation: (attempt: number) => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation(attempt)
+    } catch (error) {
+      lastError = error
+      const message = error instanceof Error ? error.message : String(error)
+      const transient = /failed to fetch|networkerror|timeout|temporarily|502|503|504/i.test(message)
+      if (!transient || attempt === attempts) break
+      await new Promise((resolve) => setTimeout(resolve, 400 * 2 ** (attempt - 1)))
+    }
+  }
+  throw lastError
+}
+
 export async function listLiveMarkets(): Promise<LiveMarketsResult> {
   const exchange = new SomniaMarkets({
     chain: somniaShannon,
@@ -516,7 +534,7 @@ export async function listLiveMarkets(): Promise<LiveMarketsResult> {
   })
 
   try {
-    const liveMarkets = await exchange.client.listLiveBinaryMarkets({ limit: 50 })
+    const liveMarkets = await withIndexerRetry(() => exchange.client.listLiveBinaryMarkets({ limit: 50 }))
     const candidates = selectCandidates(liveMarkets)
     const books = await exchange.client.getBookTops(candidates.map((market) => market.marketId))
     const checked = await Promise.all(candidates.map(async (market) => {
